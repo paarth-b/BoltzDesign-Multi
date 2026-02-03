@@ -1,0 +1,7 @@
+sequences:
+- protein:
+    id:
+    - A
+    msa: empty
+    sequence: GWFKYTKWPDITPRDRDAFFDELYTNLMGAAAQHPGLYNHVARFLGKLEDEIGGPDPYGGKVYYVW
+version: 1
