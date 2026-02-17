@@ -54,6 +54,24 @@ def setup_gpu_environment(gpu_id):
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
 
+def get_forwarded_args(argv):
+    """Remove multi-GPU-specific args from argv for forwarding to subprocesses."""
+    skip_next = False
+    skip_flags = {'--gpu_ids', '--design_samples', '--sample_offset', '--gpu_id'}
+    result = []
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in skip_flags:
+            skip_next = True
+            continue
+        if any(arg.startswith(f'{f}=') for f in skip_flags):
+            continue
+        result.append(arg)
+    return result
+
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -199,8 +217,12 @@ Examples:
     # System configuration
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='GPU ID to use')
+    parser.add_argument('--gpu_ids', type=str, default='',
+                        help='Comma-separated GPU IDs for multi-GPU parallel design (e.g., "0,1,2,3"). Overrides --gpu_id.')
     parser.add_argument('--design_samples', type=int, default=1,
                         help='Number of design samples')
+    parser.add_argument('--sample_offset', type=int, default=0,
+                        help='Offset for sample numbering (used internally for multi-GPU dispatch)')
     parser.add_argument('--work_dir', type=str, default=None,
                         help='Working directory (default: current directory)')
     parser.add_argument('--high_iptm', type=str2bool, default=True,
@@ -384,6 +406,7 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         boltz_model=boltz_model,
         ccd_path=args.ccd_path,
         design_samples=args.design_samples,
+        sample_offset=args.sample_offset,
         version_name=version_name,
         config=config,
         loss_scales=loss_scales,
@@ -783,6 +806,39 @@ def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir):
 
 def main():
     """Main function for running the BoltzDesign pipeline"""
+    # Multi-GPU dispatch: spawn one subprocess per GPU, then exit
+    args = parse_arguments()
+    if args.gpu_ids:
+        gpu_list = [int(x.strip()) for x in args.gpu_ids.split(',')]
+        total_samples = args.design_samples
+        base = total_samples // len(gpu_list)
+        remainder = total_samples % len(gpu_list)
+
+        processes = []
+        offset = 0
+        for i, gpu_id in enumerate(gpu_list):
+            n = base + (1 if i < remainder else 0)
+            if n == 0:
+                continue
+            cmd = [sys.executable, os.path.abspath(__file__),
+                   '--gpu_id', str(gpu_id),
+                   '--design_samples', str(n),
+                   '--sample_offset', str(offset)]
+            cmd.extend(get_forwarded_args(sys.argv[1:]))
+            print(f"Launching GPU {gpu_id}: {n} samples (offset {offset})")
+            processes.append(subprocess.Popen(cmd))
+            offset += n
+
+        for p in processes:
+            p.wait()
+
+        failed = [i for i, p in enumerate(processes) if p.returncode != 0]
+        if failed:
+            print(f"Warning: GPU workers {failed} exited with errors")
+        else:
+            print("All GPU workers completed successfully!")
+        return
+
     args = setup_environment()
     boltz_model, config_obj = initialize_pipeline(args)
     yaml_dict, yaml_dir = generate_yaml_config(args, config_obj)

@@ -14,6 +14,15 @@ __pycache__/
 *.egg-info/
 *.egg
 
+# Outputs
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Binaries
+DAlphaBall.gcc
+
 # Misc
 .DS_Store
 *.swp

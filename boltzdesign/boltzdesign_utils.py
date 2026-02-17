@@ -30,6 +30,7 @@ import csv
 import gc
 import json
 import logging
+import fcntl
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -698,24 +699,36 @@ def boltz_hallucination(
 
         prev_sequence=""
         
-        # Modified to average loss over all states
+        # Modified to average loss over all states with per-state gradient accumulation
+        # to avoid holding all states' computation graphs in memory simultaneously.
         def get_model_loss(batches, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run=False, mask_ligand=False, distogram_only=False, predict_args=None, loss_scales=None, binder_chain='A', increasing_contact_over_itr=False, optimize_contact_per_binder_pos=False, num_inter_contacts=2, num_intra_contacts=4,  num_optimizing_binder_pos =1, inter_chain_cutoff=21.0, intra_chain_cutoff=14.0, save_trajectory=False):
             traj_coords = None
             traj_plddt = None
-            
-            total_loss_all = 0
-            losses_accumulated = {
-                'con_loss': 0, 'i_con_loss': 0, 'helix_loss': 0,
-                'plddt_loss': 0, 'i_pae_loss': 0, 'pae_loss': 0, 'rg_loss': 0
+
+            # Track scalar loss values for logging (no grad needed)
+            losses_scalar = {
+                'con_loss': 0.0, 'i_con_loss': 0.0, 'helix_loss': 0.0,
+                'plddt_loss': 0.0, 'i_pae_loss': 0.0, 'pae_loss': 0.0, 'rg_loss': 0.0
             }
-            
-            # Loop over all states/batches
+            total_loss_scalar = 0.0
+
+            num_states = len(batches)
+
+            if loss_scales is None:
+                loss_scales = {
+                    'con_loss': 1.0,
+                    'i_con_loss': 1.0,
+                    'helix_loss': random.uniform(-0.4, 0.0),
+                    'plddt_loss': 0.1,
+                    'pae_loss': 0.4,
+                    'i_pae_loss': 0.1,
+                    'rg_loss': 0.0,
+                }
+
+            # Loop over all states/batches — backward after each to free graph memory
             for b_idx, batch in enumerate(batches):
                 chain_mask = chain_masks[b_idx]
-                print(f"Batch {b_idx} msa_mask shape: {batch.get('msa_mask', 'NOT FOUND')}")
                 if 'msa_mask' in batch:
-                    print(f"  dtype: {batch['msa_mask'].dtype}, device: {batch['msa_mask'].device}")
-                    # Force to float32
                     batch['msa_mask'] = batch['msa_mask'].float()
                 # Handle masking first if needed
                 if pre_run and mask_ligand:
@@ -763,19 +776,19 @@ def boltz_hallucination(
                         num_optimizing_binder_pos_curr = 0 if pre_run else num_optimizing_binder_pos
                         i_con_loss = get_con_loss(pdist, mid_pts,
                                                 num=num_inter_contacts, seqsep=0, num_pos=num_optimizing_binder_pos_curr,
-                                                cutoff=inter_chain_cutoff, binary=False, 
+                                                cutoff=inter_chain_cutoff, binary=False,
                                                 mask_1d=chain_mask, mask_1b=1-chain_mask)
                     else:
                         i_con_loss = get_con_loss(pdist, mid_pts,
                                                 num=num_inter_contacts, seqsep=0,
-                                                cutoff=inter_chain_cutoff, binary=False, 
+                                                cutoff=inter_chain_cutoff, binary=False,
                                                 mask_1d=chain_mask, mask_1b=1-chain_mask)
 
                 else:
-            
+
                     i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0, 
-                                                cutoff=inter_chain_cutoff, binary=False, 
+                                                num=num_inter_contacts, seqsep=0,
+                                                cutoff=inter_chain_cutoff, binary=False,
                                                 mask_1d=1-chain_mask, mask_1b=chain_mask)
 
 
@@ -788,7 +801,7 @@ def boltz_hallucination(
                 losses['con_loss'] = con_loss
                 losses['helix_loss'] = helix_loss
                 if not (pre_run and mask_ligand):
-                    losses['i_con_loss'] = i_con_loss         
+                    losses['i_con_loss'] = i_con_loss
 
                 if not pre_run and not distogram_only:
                     plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask)
@@ -803,52 +816,49 @@ def boltz_hallucination(
                         'pae_loss': pae_loss,
                         'rg_loss': rg_loss
                     })
-                
-                # Accumulate weighted losses
-                for k, v in losses.items():
-                    if k in losses_accumulated:
-                         losses_accumulated[k] += v
+
+                # Compute this state's weighted loss and backward immediately
+                state_loss = sum(loss * loss_scales[name] for name, loss in losses.items() if loss != 0)
+                # Scale by 1/num_states so gradients accumulate to the correct average.
+                # retain_graph for all but last state: the shared logits→res_type subgraph
+                # is tiny, while each state's model forward graph (the big part) is freed.
+                is_last_state = (b_idx == num_states - 1)
+                (state_loss / num_states).backward(retain_graph=not is_last_state)
+
+                # Record scalar values for logging (detached, no graph references)
+                with torch.no_grad():
+                    total_loss_scalar += state_loss.item() / num_states
+                    for k, v in losses.items():
+                        if k in losses_scalar and torch.is_tensor(v) and v != 0:
+                            losses_scalar[k] += v.item() / num_states
 
                 # Visualization data (only from first state to keep clean)
                 if b_idx == 0:
                      bins = mid_points < 8.0
-                     px = torch.sum(torch.softmax(dict_out['pdistogram'], dim=-1)[:,:,:,bins], dim=-1)
-                     plots.append(px[0].detach().cpu().numpy())
-                     
+                     px = torch.sum(torch.softmax(dict_out['pdistogram'].detach(), dim=-1)[:,:,:,bins], dim=-1)
+                     plots.append(px[0].cpu().numpy())
+
                      # Store single-state metrics for history just to track progress
-                     distogram_history.append(px[0].detach().cpu().numpy())
+                     distogram_history.append(px[0].cpu().numpy())
                      # We use the sequence from the shared logits, so it's the same
                      sequence_history.append(batch['res_type'][0, :, 2:22].detach().cpu().numpy())
 
+                # Free this state's computation graph and cached memory
+                del dict_out, pdist, mid_pts, state_loss, losses
+                if not pre_run and not distogram_only:
+                    del pae
+                torch.cuda.empty_cache()
 
-            # Average losses across all states
-            num_states = len(batches)
-            avg_losses = {k: v / num_states for k, v in losses_accumulated.items()}
-
-            if loss_scales is None:
-                loss_scales = {
-                    'con_loss': 1.0,
-                    'i_con_loss': 1.0, 
-                    'helix_loss': random.uniform(-0.4, 0.0),
-                    'plddt_loss': 0.1,
-                    'pae_loss': 0.4,
-                    'i_pae_loss': 0.1,
-                    'rg_loss': 0.0,
-                }
-
-            # Calculate total loss
-            total_loss = sum(loss * loss_scales[name] for name, loss in avg_losses.items() if loss != 0)
-            
-            # Update history lists
-            loss_history.append(total_loss.item())
-            i_con_loss_history.append(avg_losses['i_con_loss'].item() if torch.is_tensor(avg_losses['i_con_loss']) else avg_losses['i_con_loss'])
-            con_loss_history.append(avg_losses['con_loss'].item())
+            # Update history lists with scalar values
+            loss_history.append(total_loss_scalar)
+            i_con_loss_history.append(losses_scalar['i_con_loss'])
+            con_loss_history.append(losses_scalar['con_loss'])
             if not pre_run and not distogram_only:
-                 plddt_loss_history.append(avg_losses['plddt_loss'].item())
-            
-            loss_str = [f"{k}:{v.item():.2f}" for k,v in avg_losses.items() if torch.is_tensor(v) and v != 0]
+                 plddt_loss_history.append(losses_scalar['plddt_loss'])
 
-            return total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
+            loss_str = [f"{k}:{v:.2f}" for k,v in losses_scalar.items() if v != 0]
+
+            return total_loss_scalar, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
         
         def update_sequence(opt, batches, mask, alpha=2.0, non_protein_target=False, binder_chain='A'):
             # The logic here updates the SHARED logits. 
@@ -915,10 +925,8 @@ def boltz_hallucination(
                 diff_count = sum(1 for a, b in zip(current_sequence, prev_sequence) if a != b)
                 diff_percentage = (diff_count / length) * 100
             prev_sequence = current_sequence
-            
-            # Backpropagate
-            total_loss.backward()
-            
+
+            # Backward already done per-state inside get_model_loss.
             # Apply gradients to the shared parameter (batches[0]['res_type_logits'])
             if batches[0]['res_type_logits'].grad is not None:
                 batches[0]['res_type_logits'].grad[batches[0]['entity_id']!=chain_to_number[binder_chain],:] = 0
@@ -927,7 +935,7 @@ def boltz_hallucination(
                 optimizer.step()
                 optimizer.zero_grad()
                 current_lr = optimizer.param_groups[0]['lr']
-                print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss.item():.2f}, {loss_str}")
+                print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss:.2f}, {loss_str}")
         
         return batches[0], plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list
 
@@ -1095,6 +1103,7 @@ def run_boltz_design(
     boltz_model,
     ccd_path,
     design_samples =1,
+    sample_offset=0,
     version_name=None,
     config=None,
     loss_scales=None,
@@ -1199,6 +1208,7 @@ def run_boltz_design(
             print(f"Processing target {target_binder_input} with input files: {[p.name for p in yaml_path_list]}")
 
             for itr in range(design_samples):
+                actual_itr = itr + sample_offset
                 config['length'] = random.randint(config['length_min'],config['length_max'])
                 filtered_config['length'] = config['length']
                 loss_scales['helix_loss'] = random.uniform(config['helix_loss_min'], config['helix_loss_max'])
@@ -1303,12 +1313,12 @@ def run_boltz_design(
                     plt.tight_layout(pad=3.0)
                     
                     if loss_dir:
-                        plt.savefig(os.path.join(loss_dir, f'{target_binder_input}_loss_history_itr{itr + 1}_length{config["length"]}.png'),
+                        plt.savefig(os.path.join(loss_dir, f'{target_binder_input}_loss_history_itr{actual_itr + 1}_length{config["length"]}.png'),
                                   facecolor='#1C1C1C', edgecolor='none', bbox_inches='tight', dpi=300)
                     plt.show()
                     plt.close()
 
-                    distogram_ani, sequence_ani = visualize_training_history(best_batch, loss_history, sequence_history, distogram_history, config["length"], binder_chain=config['binder_chain'], save_dir=animation_save_dir, save_filename=f"{target_binder_input}_itr{itr + 1}_length{config['length']}")
+                    distogram_ani, sequence_ani = visualize_training_history(best_batch, loss_history, sequence_history, distogram_history, config["length"], binder_chain=config['binder_chain'], save_dir=animation_save_dir, save_filename=f"{target_binder_input}_itr{actual_itr + 1}_length{config['length']}")
                     if show_animation:
                         from IPython.display import display, HTML
                         display(HTML(f"<div style='display:flex;gap:10px'><div style='flex:0.4'>{distogram_ani.to_jshtml()}</div><div style='flex:0.6'>{sequence_ani.to_jshtml()}</div></div>"))
@@ -1320,11 +1330,15 @@ def run_boltz_design(
                     continue
     
                 with open(rmsd_csv_path, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    if not csv_exists:
-                        writer.writerow(['target', 'length', 'iteration', 'apo_holo_rmsd', 'complex_plddt', 'iptm',  'helix_loss'])
-                        csv_exists = True
-                    writer.writerow([target_binder_input, config['length'], itr + 1, rmsd, output['complex_plddt'].item(), output['iptm'].item(), loss_scales['helix_loss']])
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    try:
+                        writer = csv.writer(f)
+                        if not csv_exists:
+                            writer.writerow(['target', 'length', 'iteration', 'apo_holo_rmsd', 'complex_plddt', 'iptm',  'helix_loss'])
+                            csv_exists = True
+                        writer.writerow([target_binder_input, config['length'], actual_itr + 1, rmsd, output['complex_plddt'].item(), output['iptm'].item(), loss_scales['helix_loss']])
+                    finally:
+                        fcntl.flock(f, fcntl.LOCK_UN)
     
                 best_batch_cpu = {k: v.detach().cpu().numpy() if torch.is_tensor(v) else v for k, v in best_batch.items()}
                 best_sequence = ''.join([alphabet[i] for i in np.argmax(best_batch_cpu['res_type'][best_batch_cpu['entity_id']==chain_to_number[config['binder_chain']],:], axis=-1)])
@@ -1333,7 +1347,7 @@ def run_boltz_design(
                 # Save results for all states in the group
                 for yp in yaml_path_list:
                     # Construct output filename based on original stem to preserve state info (e.g. 5zmc_0 -> 5zmc_0_results...)
-                    out_name = f"{yp.stem}_results_itr{itr + 1}_length{config['length']}.yaml"
+                    out_name = f"{yp.stem}_results_itr{actual_itr + 1}_length{config['length']}.yaml"
                     result_yaml = os.path.join(results_yaml_dir, out_name)
                     result_yaml_apo = os.path.join(results_yaml_dir_apo, out_name)
     
