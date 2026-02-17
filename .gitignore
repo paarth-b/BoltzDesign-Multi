@@ -1,0 +1,21 @@
+# Log files
+*.log
+*.out
+*.err
+sl.*.out
+sl.*.err
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Egg info
+*.egg-info/
+*.egg
+
+# Misc
+.DS_Store
+*.swp
+*.swo
+*~
