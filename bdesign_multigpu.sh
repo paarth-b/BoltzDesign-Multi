@@ -8,8 +8,8 @@
 #SBATCH --gres=gpu:v100:2
 #SBATCH --constraint=v100_32
 #SBATCH --mem=80G
-#SBATCH -o sl.%j.out         # file to save job's STDOUT (%j = JobId)
-#SBATCH -e sl.%j.err         # file to save job's STDERR (%j = JobId)
+#SBATCH -o logs/sl.%j.out         # file to save job's STDOUT (%j = JobId)
+#SBATCH -e logs/sl.%j.err         # file to save job's STDERR (%j = JobId)
 #SBATCH --export=NONE           # Purge the job-submitting shell environmet
 
 export NO_AI_TRACKING=1

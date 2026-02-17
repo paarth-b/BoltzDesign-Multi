@@ -31,6 +31,7 @@ import gc
 import json
 import logging
 import fcntl
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -483,7 +484,12 @@ def boltz_hallucination(
     optimizer_type='SGD',
     save_trajectory=False,
     noise_scaling=0.1,
+    model_replicas=None,
 ):
+    # Derive device list from model replicas
+    if model_replicas is None:
+        model_replicas = [boltz_model]
+    devices = [next(m.parameters()).device for m in model_replicas]
 
     predict_args = {
         "recycling_steps": recycling_steps,  # Default value
@@ -512,7 +518,7 @@ def boltz_hallucination(
     # Parse all targets
     targets = [parse_boltz_schema(name, d, ccd_lib) for d in multi_state_data]
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = devices[0]
     boltz_model.train() if set_train else boltz_model.eval()
     print(f"set in {'train' if set_train else 'eval'} mode")
 
@@ -576,35 +582,22 @@ def boltz_hallucination(
             batch['record'] = target.record
 
         return batch, structure
-    def validate_batch_devices(batch, device):
-        """Ensure all tensors in batch are on the same device"""
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                if value.device != device:
-                    print(f"Warning: {key} is on {value.device}, moving to {device}")
-                    batch[key] = value.to(device)
-        return batch
-    
-    # Generate batches for all states
+    # Generate batches for all states, placing each on its assigned device (round-robin)
     batches = []
     structures = []
-    for target in targets:
+    for i, target in enumerate(targets):
+        dev = devices[i % len(devices)]
         b, s = get_batch(target, max_seqs=msa_max_seqs, length=length, pocket_conditioning=pocket_conditioning)
-        b = {key: value.unsqueeze(0).to(device) for key, value in b.items()}
-        
+        b = {key: value.unsqueeze(0).to(dev) for key, value in b.items()}
         if 'msa_mask' in b:
             b['msa_mask'] = b['msa_mask'].float()
-        
         batches.append(b)
         structures.append(s)
-        
-    for i, b in enumerate(batches):
-        batches[i] = validate_batch_devices(b, device)
     # Use the first batch to initialize optimization variables
     # We assume the binder is the same chain ID and length across all states
     base_batch = batches[0]
-    
-    ## initialize res_type_logits
+
+    ## initialize res_type_logits (always on primary device)
     if pre_run:
         # Initialize one set of logits shared across all states
         res_type_logits = base_batch['res_type'].clone().detach().to(device).float()
@@ -612,21 +605,23 @@ def boltz_hallucination(
     else:
         res_type_logits = torch.from_numpy(input_res_type).to(device)
 
-    # Propagate initialization to all batches
-    for b in batches:
-        b['res_type_logits'] = res_type_logits 
-        
+    # Propagate initialization to all batches (each gets a device-local copy)
+    for i, b in enumerate(batches):
+        dev = devices[i % len(devices)]
+        b['res_type_logits'] = res_type_logits if dev == device else res_type_logits.clone().to(dev)
+
         if non_protein_target:
-            b['msa'] = b['res_type_logits'].unsqueeze(0).to(device)
-            b['msa_paired'] = torch.ones(b['res_type'].shape[0], 1, b['res_type'].shape[1]).to(device)
-            b['deletion_value'] = torch.zeros(b['res_type'].shape[0], 1, b['res_type'].shape[1]).to(device)
-            b['has_deletion'] = torch.full((b['res_type'].shape[0], 1, b['res_type'].shape[1]), False).to(device)
-            b['msa_mask'] = torch.ones(b['res_type'].shape[0], 1, b['res_type'].shape[1], dtype=torch.float32).to(device)
-            b['profile'] = b['msa'].float().mean(dim=0).to(device)
-            b['deletion_mean'] = torch.zeros(b['deletion_mean'].shape).to(device)
+            b['msa'] = b['res_type_logits'].unsqueeze(0).to(dev)
+            b['msa_paired'] = torch.ones(b['res_type'].shape[0], 1, b['res_type'].shape[1]).to(dev)
+            b['deletion_value'] = torch.zeros(b['res_type'].shape[0], 1, b['res_type'].shape[1]).to(dev)
+            b['has_deletion'] = torch.full((b['res_type'].shape[0], 1, b['res_type'].shape[1]), False).to(dev)
+            b['msa_mask'] = torch.ones(b['res_type'].shape[0], 1, b['res_type'].shape[1], dtype=torch.float32).to(dev)
+            b['profile'] = b['msa'].float().mean(dim=0).to(dev)
+            b['deletion_mean'] = torch.zeros(b['deletion_mean'].shape).to(dev)
             b['res_type'] = b['res_type'].float()
 
-    # The parameter to optimize is the shared logits tensor
+    # The parameter to optimize is the shared logits tensor on primary device
+    # Each batch's res_type_logits will be synced from this before each forward pass
     batches[0]['res_type_logits'].requires_grad = True
     optimizer = torch.optim.AdamW([batches[0]['res_type_logits']], lr=learning_rate_pre if pre_run else learning_rate) if optimizer_type == 'AdamW' else torch.optim.SGD([batches[0]['res_type_logits']], lr=learning_rate_pre if pre_run else learning_rate)
 
@@ -635,7 +630,7 @@ def boltz_hallucination(
         masked_grad = grad[:, chain_mask.squeeze(0), :] 
         eff_L = (masked_grad.pow(2).sum(-1, keepdim=True) > 0).sum(-2, keepdim=True)
         gn = masked_grad.norm(dim=(-1, -2), keepdim=True) 
-        return grad * torch.sqrt(torch.tensor(eff_L)) / (gn + 1e-7)
+        return grad * torch.sqrt(eff_L.float()) / (gn + 1e-7)
 
     alphabet = list('XXARNDCQEGHILKMFPSTWYV-')
     best_loss = float('inf')  
@@ -725,12 +720,10 @@ def boltz_hallucination(
                     'rg_loss': 0.0,
                 }
 
-            # Loop over all states/batches — backward after each to free graph memory
-            for b_idx, batch in enumerate(batches):
-                chain_mask = chain_masks[b_idx]
+            # Forward pass for a single state — called from threads for parallel execution
+            def forward_one_state(b_idx, batch, model, chain_mask):
                 if 'msa_mask' in batch:
                     batch['msa_mask'] = batch['msa_mask'].float()
-                # Handle masking first if needed
                 if pre_run and mask_ligand:
                     batch['token_pad_mask'][batch['entity_id']!=chain_to_number[binder_chain]]=0
                     masked_token_to_rep = torch.ones_like(batch['token_to_rep_atom'])
@@ -738,7 +731,6 @@ def boltz_hallucination(
                     masked_token_to_rep_index = torch.nonzero(batch['token_to_rep_atom']*masked_token_to_rep, as_tuple=True)[2]
                     batch['atom_pad_mask'][:, masked_token_to_rep_index] = 0
 
-                # Common arguments for get_distogram_confidence
                 confidence_args = {
                     'recycling_steps': predict_args["recycling_steps"],
                     'num_sampling_steps': predict_args["sampling_steps"],
@@ -749,105 +741,98 @@ def boltz_hallucination(
                     'disconnect_pairformer': disconnect_pairformer
                 }
 
-                if save_trajectory and b_idx == 0: # Only save trajectory for first state to save memory/complexity
-                    # Get model output with trajectory info
-                    dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
-                    traj_coords = dict_out['sample_atom_coords'][0].detach().cpu().numpy()
-                    traj_plddt = dict_out['plddt'][0].detach().cpu().numpy()
+                _traj_coords, _traj_plddt = None, None
+                if save_trajectory and b_idx == 0:
+                    dict_out = model.get_distogram_confidence(batch, **confidence_args)
+                    _traj_coords = dict_out['sample_atom_coords'][0].detach().cpu().numpy()
+                    _traj_plddt = dict_out['plddt'][0].detach().cpu().numpy()
                 else:
-                    # Get model output without trajectory
                     if pre_run or distogram_only:
-                        dict_out, s, z, s_inputs = boltz_model.get_distogram(batch)
+                        dict_out, s, z, s_inputs = model.get_distogram(batch)
                     else:
-                        dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
-
+                        dict_out = model.get_distogram_confidence(batch, **confidence_args)
 
                 pdist = dict_out['pdistogram']
-                mid_pts = get_mid_points(pdist).to(device)
+                mid_pts = get_mid_points(pdist).to(pdist.device)
 
-                # Calculate contact losses
                 con_loss = get_con_loss(pdist, mid_pts,
                                         num=num_intra_contacts, seqsep=9, cutoff=intra_chain_cutoff,
-                                        binary=False,
-                                        mask_1d=chain_mask, mask_1b=chain_mask)
+                                        binary=False, mask_1d=chain_mask, mask_1b=chain_mask)
 
                 if optimize_contact_per_binder_pos:
-                    if increasing_contact_over_itr:
-                        num_optimizing_binder_pos_curr = 0 if pre_run else num_optimizing_binder_pos
-                        i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0, num_pos=num_optimizing_binder_pos_curr,
-                                                cutoff=inter_chain_cutoff, binary=False,
-                                                mask_1d=chain_mask, mask_1b=1-chain_mask)
-                    else:
-                        i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0,
-                                                cutoff=inter_chain_cutoff, binary=False,
-                                                mask_1d=chain_mask, mask_1b=1-chain_mask)
-
-                else:
-
+                    num_pos = (0 if pre_run else num_optimizing_binder_pos) if increasing_contact_over_itr else None
                     i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0,
-                                                cutoff=inter_chain_cutoff, binary=False,
-                                                mask_1d=1-chain_mask, mask_1b=chain_mask)
-
+                                            num=num_inter_contacts, seqsep=0,
+                                            **(dict(num_pos=num_pos) if num_pos is not None else {}),
+                                            cutoff=inter_chain_cutoff, binary=False,
+                                            mask_1d=chain_mask, mask_1b=1-chain_mask)
+                else:
+                    i_con_loss = get_con_loss(pdist, mid_pts,
+                                            num=num_inter_contacts, seqsep=0,
+                                            cutoff=inter_chain_cutoff, binary=False,
+                                            mask_1d=1-chain_mask, mask_1b=chain_mask)
 
                 mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
-                helix_loss = _get_helix_loss(pdist, mid_pts,
-                                        offset=None, mask_2d=mask_2d, binary=True)
+                helix_loss = _get_helix_loss(pdist, mid_pts, offset=None, mask_2d=mask_2d, binary=True)
 
-
-                losses = {}
-                losses['con_loss'] = con_loss
-                losses['helix_loss'] = helix_loss
+                losses = {'con_loss': con_loss, 'helix_loss': helix_loss}
                 if not (pre_run and mask_ligand):
                     losses['i_con_loss'] = i_con_loss
-
                 if not pre_run and not distogram_only:
-                    plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask)
                     pae = (dict_out['pae'] + dict_out['pae'].transpose(-2,-1))/2
-                    i_pae_loss = get_pae_loss(pae, mask_1d=1-chain_mask, mask_1b=chain_mask)
-                    pae_loss = get_pae_loss(pae, mask_1d=chain_mask, mask_1b=chain_mask)
-                    rg_loss, rg = add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain)
-
                     losses.update({
-                        'plddt_loss': plddt_loss,
-                        'i_pae_loss': i_pae_loss,
-                        'pae_loss': pae_loss,
-                        'rg_loss': rg_loss
+                        'plddt_loss': get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask),
+                        'i_pae_loss': get_pae_loss(pae, mask_1d=1-chain_mask, mask_1b=chain_mask),
+                        'pae_loss': get_pae_loss(pae, mask_1d=chain_mask, mask_1b=chain_mask),
+                        'rg_loss': add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain)[0]
                     })
 
-                # Compute this state's weighted loss and backward immediately
                 state_loss = sum(loss * loss_scales[name] for name, loss in losses.items() if loss != 0)
-                # Scale by 1/num_states so gradients accumulate to the correct average.
-                # retain_graph for all but last state: the shared logits→res_type subgraph
-                # is tiny, while each state's model forward graph (the big part) is freed.
-                is_last_state = (b_idx == num_states - 1)
-                (state_loss / num_states).backward(retain_graph=not is_last_state)
 
-                # Record scalar values for logging (detached, no graph references)
+                # Visualization data (only from first state)
+                viz = None
+                if b_idx == 0:
+                    bins = mid_points < 8.0
+                    px = torch.sum(torch.softmax(pdist.detach(), dim=-1)[:,:,:,bins], dim=-1)
+                    viz = (px[0].cpu().numpy(), batch['res_type'][0, :, 2:22].detach().cpu().numpy())
+
+                return state_loss, losses, viz, _traj_coords, _traj_plddt
+
+            # Run forward passes in parallel across GPUs, sequential backward
+            forward_args = [(b_idx, batches[b_idx], model_replicas[b_idx % len(model_replicas)], chain_masks[b_idx])
+                            for b_idx in range(num_states)]
+
+            if len(model_replicas) > 1:
+                with ThreadPoolExecutor(max_workers=len(model_replicas)) as pool:
+                    results = list(pool.map(lambda args: forward_one_state(*args), forward_args))
+            else:
+                results = [forward_one_state(*args) for args in forward_args]
+
+            # Aggregate losses and backward once — autograd parallelizes across devices
+            total_loss_tensor = sum(r[0].to(devices[0]) for r in results) / num_states
+            total_loss_tensor.backward()
+
+            # Logging (no grad needed)
+            for b_idx, (state_loss, losses, viz, _tc, _tp) in enumerate(results):
                 with torch.no_grad():
                     total_loss_scalar += state_loss.item() / num_states
                     for k, v in losses.items():
                         if k in losses_scalar and torch.is_tensor(v) and v != 0:
                             losses_scalar[k] += v.item() / num_states
 
-                # Visualization data (only from first state to keep clean)
-                if b_idx == 0:
-                     bins = mid_points < 8.0
-                     px = torch.sum(torch.softmax(dict_out['pdistogram'].detach(), dim=-1)[:,:,:,bins], dim=-1)
-                     plots.append(px[0].cpu().numpy())
+                if viz is not None:
+                    plots.append(viz[0])
+                    distogram_history.append(viz[0])
+                    sequence_history.append(viz[1])
+                if _tc is not None:
+                    traj_coords = _tc
+                if _tp is not None:
+                    traj_plddt = _tp
 
-                     # Store single-state metrics for history just to track progress
-                     distogram_history.append(px[0].cpu().numpy())
-                     # We use the sequence from the shared logits, so it's the same
-                     sequence_history.append(batch['res_type'][0, :, 2:22].detach().cpu().numpy())
+                del state_loss, losses
 
-                # Free this state's computation graph and cached memory
-                del dict_out, pdist, mid_pts, state_loss, losses
-                if not pre_run and not distogram_only:
-                    del pae
-                torch.cuda.empty_cache()
+            del total_loss_tensor
+            torch.cuda.empty_cache()
 
             # Update history lists with scalar values
             loss_history.append(total_loss_scalar)
@@ -865,7 +850,7 @@ def boltz_hallucination(
             shared_logits = batches[0]['res_type_logits']
             
             scaled_logits = alpha * shared_logits
-            X = scaled_logits - torch.sum(torch.eye(scaled_logits.shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10)
+            X = scaled_logits - torch.sum(torch.eye(scaled_logits.shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(shared_logits.device)*(1e10)
             soft = torch.softmax(X/opt["temp"],dim=-1)
             hard = torch.zeros_like(soft).scatter_(-1, soft.max(dim=-1, keepdim=True)[1], 1.0)
             hard = (hard - soft).detach() + soft
@@ -873,22 +858,23 @@ def boltz_hallucination(
             pseudo = opt["hard"] * hard + (1-opt["hard"]) * pseudo
             res_type = pseudo*mask + shared_logits*(1-mask)
             
-            # Apply to all batches
+            # Apply to all batches, moving tensors to each batch's device
             for b in batches:
-                b['logits'] = scaled_logits
-                b['soft'] = soft
-                b['hard'] = hard
-                b['pseudo'] = pseudo
-                b['res_type'] = res_type
+                bdev = b['msa'].device
+                b['logits'] = scaled_logits.to(bdev)
+                b['soft'] = soft.to(bdev)
+                b['hard'] = hard.to(bdev)
+                b['pseudo'] = pseudo.to(bdev)
+                b['res_type'] = res_type.to(bdev)
                 if 'msa_mask' in b:
                     b['msa_mask'] = b['msa_mask'].float()
-                    
+
                 if non_protein_target:
-                    b['msa'] = b['res_type'].unsqueeze(0).to(device).detach()
-                    b['profile'] = b['msa'].float().mean(dim=0).to(device).detach()
+                    b['msa'] = b['res_type'].unsqueeze(0).detach()
+                    b['profile'] = b['msa'].float().mean(dim=0).detach()
                 else:
-                    b['msa'][:,0,:,:] = b['res_type'].to(device).detach()
-                    b['profile'][b['entity_id']==chain_to_number[binder_chain],:] = b['msa'][:, 0, (b['entity_id']==chain_to_number[binder_chain])[0],:].float().mean(dim=1).to(device).detach()
+                    b['msa'][:,0,:,:] = b['res_type'].detach()
+                    b['profile'][b['entity_id']==chain_to_number[binder_chain],:] = b['msa'][:, 0, (b['entity_id']==chain_to_number[binder_chain])[0],:].float().mean(dim=1).detach()
 
             return batches
         
@@ -1111,6 +1097,8 @@ def run_boltz_design(
     show_animation=False,
     save_trajectory=False,
     redo_boltz_predict=True,
+    devices=None,
+    checkpoint=None,
 ):
     """
     Run Boltz protein design pipeline.
@@ -1202,9 +1190,28 @@ def run_boltz_design(
              yaml_groups[base_name] = []
         yaml_groups[base_name].append(yaml_path)
 
+    # Build model replicas for multi-GPU by loading fresh from checkpoint
+    _model_replicas = None
+    if devices is not None and len(devices) > 1 and checkpoint is not None:
+        print(f"Loading model replicas on {len(devices)} devices: {devices}")
+        predict_args = {
+            "recycling_steps": config.get('recycling_steps', 0),
+            "sampling_steps": 100,
+            "diffusion_samples": 1,
+            "write_confidence_summary": True,
+            "write_full_pae": False,
+            "write_full_pde": False,
+        }
+        _model_replicas = [boltz_model]
+        for dev in devices[1:]:
+            replica = get_boltz_model(checkpoint, predict_args, device=dev)
+            replica.train() if config.get('set_train', True) else replica.eval()
+            _model_replicas.append(replica)
+        print(f"Model replicas loaded successfully")
+
     for target_binder_input, yaml_path_list in yaml_groups.items():
             # Sort to ensure consistent order
-            yaml_path_list.sort() 
+            yaml_path_list.sort()
             print(f"Processing target {target_binder_input} with input files: {[p.name for p in yaml_path_list]}")
 
             for itr in range(design_samples):
@@ -1224,9 +1231,10 @@ def run_boltz_design(
                     input_res_type=False,
                     loss_scales=loss_scales,
                     chain_to_number=chain_to_number,
-                    save_trajectory=save_trajectory
+                    save_trajectory=save_trajectory,
+                    model_replicas=_model_replicas,
                 )
-                print('warm up done')      
+                print('warm up done')
                 output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo ,distogram_history_2, sequence_history_2, loss_history_2, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list_2, traj_plddt_list_2, structure = boltz_hallucination(
                     boltz_model,
                     yaml_path_list,
@@ -1236,7 +1244,8 @@ def run_boltz_design(
                     input_res_type=input_res_type,
                     loss_scales=loss_scales,
                     chain_to_number=chain_to_number,
-                    save_trajectory=save_trajectory
+                    save_trajectory=save_trajectory,
+                    model_replicas=_model_replicas,
                 )
                 loss_history.extend(loss_history_2)
                 distogram_history.extend(distogram_history_2) 

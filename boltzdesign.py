@@ -48,28 +48,18 @@ def str2bool(v):
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-def setup_gpu_environment(gpu_id):
-    """Setup GPU environment variables"""
+def setup_gpu_environment(gpu_id, visible_devices=None):
+    """Setup GPU environment variables.
+
+    If visible_devices is provided (e.g. "0,1,2"), all listed GPUs stay visible.
+    Otherwise, restrict to a single gpu_id.
+    """
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-
-def get_forwarded_args(argv):
-    """Remove multi-GPU-specific args from argv for forwarding to subprocesses."""
-    skip_next = False
-    skip_flags = {'--gpu_ids', '--design_samples', '--sample_offset', '--gpu_id'}
-    result = []
-    for arg in argv:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg in skip_flags:
-            skip_next = True
-            continue
-        if any(arg.startswith(f'{f}=') for f in skip_flags):
-            continue
-        result.append(arg)
-    return result
 
 
 def parse_arguments():
@@ -218,11 +208,9 @@ Examples:
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='GPU ID to use')
     parser.add_argument('--gpu_ids', type=str, default='',
-                        help='Comma-separated GPU IDs for multi-GPU parallel design (e.g., "0,1,2,3"). Overrides --gpu_id.')
+                        help='Comma-separated GPU IDs for multi-GPU parallel conformations (e.g., "0,1,2,3"). Overrides --gpu_id.')
     parser.add_argument('--design_samples', type=int, default=1,
                         help='Number of design samples')
-    parser.add_argument('--sample_offset', type=int, default=0,
-                        help='Offset for sample numbering (used internally for multi-GPU dispatch)')
     parser.add_argument('--work_dir', type=str, default=None,
                         help='Working directory (default: current directory)')
     parser.add_argument('--high_iptm', type=str2bool, default=True,
@@ -382,10 +370,10 @@ def update_config_with_args(config, args):
             config[param_name] = param_value
     return config
     
-def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version_name):
+def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version_name, devices=None):
     """Run the Boltz design step"""
     print("Starting Boltz design step...")
-    
+
     loss_scales = {
         'con_loss': args.con_loss,
         'i_con_loss': args.i_con_loss,
@@ -394,11 +382,11 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         'i_pae_loss': args.i_pae_loss,
         'rg_loss': args.rg_loss,
     }
-    
+
     boltz_path = shutil.which("boltz")
     if boltz_path is None:
         raise FileNotFoundError("The 'boltz' command was not found in the system PATH.")
-    
+
     run_boltz_design(
         boltz_path=boltz_path,
         main_dir=main_dir,
@@ -406,13 +394,15 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         boltz_model=boltz_model,
         ccd_path=args.ccd_path,
         design_samples=args.design_samples,
-        sample_offset=args.sample_offset,
+        sample_offset=0,
         version_name=version_name,
         config=config,
         loss_scales=loss_scales,
         show_animation=args.show_animation,
         save_trajectory=args.save_trajectory,
         redo_boltz_predict=args.redo_boltz_predict,
+        devices=devices,
+        checkpoint=args.boltz_checkpoint,
     )
     
     print("Boltz design step completed!")
@@ -627,12 +617,16 @@ def run_rosetta_step(args, ligandmpnn_dir, val_output_dir, val_output_apo_dir, v
     
     print("Rosetta energy calculation completed!")
 
-def setup_environment():
+def setup_environment(args=None):
     """Setup environment and parse arguments"""
-    args = parse_arguments()
+    if args is None:
+        args = parse_arguments()
     work_dir = args.work_dir or os.getcwd()
     os.chdir(work_dir)
-    setup_gpu_environment(args.gpu_id)
+    if args.gpu_ids:
+        setup_gpu_environment(args.gpu_id, visible_devices=args.gpu_ids)
+    else:
+        setup_gpu_environment(args.gpu_id)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     return args
@@ -779,13 +773,13 @@ def modification_to_wt_aa(modifications, modifications_wt):
         mod_to_wt_aa[mod] = wt
     return mod_to_wt_aa
 
-def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir):
+def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir, devices=None):
     """Run the pipeline steps based on arguments"""
     results = {'ligandmpnn_dir': f"{output_dir['main_dir']}/{output_dir['version']}/ligandmpnn_cutoff_{args.cutoff}", 'val_output_dir': None, 'val_output_apo_dir': None, 'val_pdb_dir': None, 'val_pdb_dir_apo': None}
-    
+
     if args.run_boltz_design:
-        run_boltz_design_step(args, config, boltz_model, yaml_dir, 
-                            output_dir['main_dir'], output_dir['version'])
+        run_boltz_design_step(args, config, boltz_model, yaml_dir,
+                            output_dir['main_dir'], output_dir['version'], devices=devices)
 
     if args.run_ligandmpnn:
         run_ligandmpnn_step(
@@ -806,40 +800,16 @@ def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir):
 
 def main():
     """Main function for running the BoltzDesign pipeline"""
-    # Multi-GPU dispatch: spawn one subprocess per GPU, then exit
     args = parse_arguments()
+
+    # Build device list for multi-GPU conformations mode
+    devices = None
     if args.gpu_ids:
         gpu_list = [int(x.strip()) for x in args.gpu_ids.split(',')]
-        total_samples = args.design_samples
-        base = total_samples // len(gpu_list)
-        remainder = total_samples % len(gpu_list)
+        devices = [torch.device(f"cuda:{i}") for i in range(len(gpu_list))]
+        print(f"Multi-GPU conformations mode: using GPUs {gpu_list} -> devices {devices}")
 
-        processes = []
-        offset = 0
-        for i, gpu_id in enumerate(gpu_list):
-            n = base + (1 if i < remainder else 0)
-            if n == 0:
-                continue
-            cmd = [sys.executable, os.path.abspath(__file__),
-                   '--gpu_id', str(gpu_id),
-                   '--design_samples', str(n),
-                   '--sample_offset', str(offset)]
-            cmd.extend(get_forwarded_args(sys.argv[1:]))
-            print(f"Launching GPU {gpu_id}: {n} samples (offset {offset})")
-            processes.append(subprocess.Popen(cmd))
-            offset += n
-
-        for p in processes:
-            p.wait()
-
-        failed = [i for i, p in enumerate(processes) if p.returncode != 0]
-        if failed:
-            print(f"Warning: GPU workers {failed} exited with errors")
-        else:
-            print("All GPU workers completed successfully!")
-        return
-
-    args = setup_environment()
+    args = setup_environment(args)
     boltz_model, config_obj = initialize_pipeline(args)
     yaml_dict, yaml_dir = generate_yaml_config(args, config_obj)
 
@@ -851,20 +821,20 @@ def main():
                 print(f"    - {item}")
         else:
             print(f"  {key}: {value}")
-    
+
     # Setup pipeline configuration
     config = setup_pipeline_config(args)
     output_dir = setup_output_directories(args)
-    
+
     # Run pipeline steps
     print("config:")
     items = list(config.items())
     max_key_len = max(len(key) for key, _ in items)
     max_val_len = max(len(str(val)) for _, val in items)
-    
+
     # Print header
     print("  " + "=" * (max_key_len + max_val_len + 5))
-    
+
     # Print items in two columns
     for i in range(0, len(items), 2):
         key1, value1 = items[i]
@@ -874,10 +844,10 @@ def main():
                   f"{key2:<{max_key_len}}: {value2}")
         else:
             print(f"  {key1:<{max_key_len}}: {value1}")
-    
+
     print("  " + "=" * (max_key_len + max_val_len + 5))
-    results = run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir)
-    
+    results = run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir, devices=devices)
+
     print("Pipeline completed successfully!")
 
 
