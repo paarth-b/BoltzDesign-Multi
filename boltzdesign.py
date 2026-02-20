@@ -1,11 +1,14 @@
 import os
 import sys
 import argparse
+import traceback
 import yaml
 import json
 import shutil
 import pickle
 import glob
+import socket
+import datetime
 import numpy as np
 import random
 import logging
@@ -23,6 +26,8 @@ from alphafold_utils import *
 from input_utils import *
 from utils import *
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 
 # Configure logging
@@ -60,6 +65,48 @@ def setup_gpu_environment(gpu_id, visible_devices=None):
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
+
+def find_free_port():
+    """Find a free port on localhost for NCCL."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+def distributed_worker(rank, world_size, port, args, config, output_dir, yaml_dir):
+    """
+    Each rank loads its own model and participates in the design loop via
+    dist.all_reduce for gradient synchronization. Post-design steps are
+    handled in the main process after all workers exit.
+    """
+    # CUDA_VISIBLE_DEVICES is already set to all GPUs; rank maps to remapped index
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = str(port)
+    dist.init_process_group(
+        backend='nccl', rank=rank, world_size=world_size,
+        timeout=datetime.timedelta(minutes=5),
+    )
+
+    try:
+        print(f"[Rank {rank}] Initialized on {device}")
+        boltz_model, _ = load_boltz_model(args, device)
+
+        if args.run_boltz_design:
+            run_boltz_design_step(
+                args, config, boltz_model, yaml_dir,
+                output_dir['main_dir'], output_dir['version'],
+                rank=rank, world_size=world_size,
+            )
+    except Exception as e:
+        print(f"[Rank {rank}] Error: {e}")
+        traceback.print_exc()
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def parse_arguments():
@@ -370,7 +417,7 @@ def update_config_with_args(config, args):
             config[param_name] = param_value
     return config
     
-def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version_name, devices=None):
+def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version_name, rank=0, world_size=1):
     """Run the Boltz design step"""
     print("Starting Boltz design step...")
 
@@ -394,37 +441,38 @@ def run_boltz_design_step(args, config, boltz_model, yaml_dir, main_dir, version
         boltz_model=boltz_model,
         ccd_path=args.ccd_path,
         design_samples=args.design_samples,
-        sample_offset=0,
         version_name=version_name,
         config=config,
         loss_scales=loss_scales,
         show_animation=args.show_animation,
         save_trajectory=args.save_trajectory,
         redo_boltz_predict=args.redo_boltz_predict,
-        devices=devices,
-        checkpoint=args.boltz_checkpoint,
+        rank=rank,
+        world_size=world_size,
     )
-    
+
     print("Boltz design step completed!")
 
 def run_ligandmpnn_step(args, main_dir, version_name, ligandmpnn_dir, yaml_dir, work_dir):
     """Run the LigandMPNN redesign step"""
     print("Starting LigandMPNN redesign step...")
-    # Setup LigandMPNN config
-    yaml_path = f"{work_dir}/LigandMPNN/run_ligandmpnn_logits_config.yaml"
-    with open(yaml_path, "r") as f:
+    # Resolve ${CWD} placeholders and write to output dir
+    template_path = f"{work_dir}/LigandMPNN/run_ligandmpnn_logits_config.yaml"
+    with open(template_path, "r") as f:
         mpnn_config = yaml.safe_load(f)
-    
+
     for key, value in mpnn_config.items():
         if isinstance(value, str) and "${CWD}" in value:
             mpnn_config[key] = value.replace("${CWD}", work_dir)
-    
+
     if not Path(mpnn_config["checkpoint_soluble_mpnn"]).exists():
         raise FileNotFoundError("LigandMPNN checkpoint file not found!")
-    
+
+    os.makedirs(ligandmpnn_dir, exist_ok=True)
+    yaml_path = os.path.join(ligandmpnn_dir, "run_ligandmpnn_logits_config.yaml")
     with open(yaml_path, "w") as f:
         yaml.dump(mpnn_config, f, default_flow_style=False)
-    
+
     # Setup directories
     boltzdesign_dir = f"{main_dir}/{version_name}/results_final"
     pdb_save_dir = f"{main_dir}/{version_name}/pdb"
@@ -649,10 +697,10 @@ def assign_chain_ids(target_ids_list, binder_chain='A'):
 
 
 def initialize_pipeline(args):
-    """Initialize models and configurations"""
+    """Initialize model and configurations (single-GPU path)"""
     work_dir = args.work_dir or os.getcwd()
     boltz_model, _ = load_boltz_model(args, torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
-    
+
     config_obj = YamlConfig(main_dir=f'{work_dir}/inputs/{args.target_type}_{args.target_name}_{args.suffix}')
     config_obj.setup_directories()
     return boltz_model, config_obj
@@ -773,13 +821,13 @@ def modification_to_wt_aa(modifications, modifications_wt):
         mod_to_wt_aa[mod] = wt
     return mod_to_wt_aa
 
-def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir, devices=None):
-    """Run the pipeline steps based on arguments"""
+def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir):
+    """Run the pipeline steps based on arguments (single-GPU path)"""
     results = {'ligandmpnn_dir': f"{output_dir['main_dir']}/{output_dir['version']}/ligandmpnn_cutoff_{args.cutoff}", 'val_output_dir': None, 'val_output_apo_dir': None, 'val_pdb_dir': None, 'val_pdb_dir_apo': None}
 
     if args.run_boltz_design:
         run_boltz_design_step(args, config, boltz_model, yaml_dir,
-                            output_dir['main_dir'], output_dir['version'], devices=devices)
+                            output_dir['main_dir'], output_dir['version'])
 
     if args.run_ligandmpnn:
         run_ligandmpnn_step(
@@ -798,19 +846,37 @@ def run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir, devices=
     
     return results
 
+def _print_config(config):
+    """Pretty-print config in two columns."""
+    print("config:")
+    items = list(config.items())
+    max_key_len = max(len(key) for key, _ in items)
+    max_val_len = max(len(str(val)) for _, val in items)
+    print("  " + "=" * (max_key_len + max_val_len + 5))
+    for i in range(0, len(items), 2):
+        key1, value1 = items[i]
+        if i+1 < len(items):
+            key2, value2 = items[i+1]
+            print(f"  {key1:<{max_key_len}}: {str(value1):<{max_val_len}}    "
+                  f"{key2:<{max_key_len}}: {value2}")
+        else:
+            print(f"  {key1:<{max_key_len}}: {value1}")
+    print("  " + "=" * (max_key_len + max_val_len + 5))
+
+
 def main():
     """Main function for running the BoltzDesign pipeline"""
     args = parse_arguments()
-
-    # Build device list for multi-GPU conformations mode
-    devices = None
-    if args.gpu_ids:
-        gpu_list = [int(x.strip()) for x in args.gpu_ids.split(',')]
-        devices = [torch.device(f"cuda:{i}") for i in range(len(gpu_list))]
-        print(f"Multi-GPU conformations mode: using GPUs {gpu_list} -> devices {devices}")
+    gpu_list = [int(x.strip()) for x in args.gpu_ids.split(',')] if args.gpu_ids else [args.gpu_id]
 
     args = setup_environment(args)
-    boltz_model, config_obj = initialize_pipeline(args)
+
+    # Done before spawn so all ranks share the same filesystem state
+    _, config_obj = initialize_pipeline(args) if len(gpu_list) == 1 else (None, YamlConfig(
+        main_dir=f'{args.work_dir or os.getcwd()}/inputs/{args.target_type}_{args.target_name}_{args.suffix}'))
+    if len(gpu_list) > 1:
+        config_obj.setup_directories()
+
     yaml_dict, yaml_dir = generate_yaml_config(args, config_obj)
 
     print("Generated YAML configuration:")
@@ -822,31 +888,32 @@ def main():
         else:
             print(f"  {key}: {value}")
 
-    # Setup pipeline configuration
     config = setup_pipeline_config(args)
     output_dir = setup_output_directories(args)
+    _print_config(config)
 
-    # Run pipeline steps
-    print("config:")
-    items = list(config.items())
-    max_key_len = max(len(key) for key, _ in items)
-    max_val_len = max(len(str(val)) for _, val in items)
-
-    # Print header
-    print("  " + "=" * (max_key_len + max_val_len + 5))
-
-    # Print items in two columns
-    for i in range(0, len(items), 2):
-        key1, value1 = items[i]
-        if i+1 < len(items):
-            key2, value2 = items[i+1]
-            print(f"  {key1:<{max_key_len}}: {str(value1):<{max_val_len}}    "
-                  f"{key2:<{max_key_len}}: {value2}")
-        else:
-            print(f"  {key1:<{max_key_len}}: {value1}")
-
-    print("  " + "=" * (max_key_len + max_val_len + 5))
-    results = run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir, devices=devices)
+    if len(gpu_list) > 1:
+        port = find_free_port()
+        print(f"Launching distributed design on GPUs {gpu_list} (port {port})")
+        mp.spawn(
+            distributed_worker,
+            args=(len(gpu_list), port, args, config, output_dir, yaml_dir),
+            nprocs=len(gpu_list),
+            join=True,
+        )
+        # Post-design steps run in the main process after all workers exit cleanly
+        work_dir = args.work_dir or os.getcwd()
+        ligandmpnn_dir = f"{output_dir['main_dir']}/{output_dir['version']}/ligandmpnn_cutoff_{args.cutoff}"
+        if args.run_ligandmpnn:
+            run_ligandmpnn_step(args, output_dir['main_dir'], output_dir['version'], ligandmpnn_dir, yaml_dir, work_dir)
+        if args.run_validation:
+            mod_to_wt_aa_val = modification_to_wt_aa(args.modifications, args.modifications_wt)
+            run_boltz_validation_step(args, ligandmpnn_dir, work_dir, mod_to_wt_aa_val)
+        if args.run_rosetta:
+            run_rosetta_step(args, ligandmpnn_dir, None, None, None, None)
+    else:
+        boltz_model, _ = load_boltz_model(args, torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
+        results = run_pipeline_steps(args, config, boltz_model, yaml_dir, output_dir)
 
     print("Pipeline completed successfully!")
 
