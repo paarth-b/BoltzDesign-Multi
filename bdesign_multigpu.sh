@@ -4,9 +4,8 @@
 #SBATCH -c 16
 #SBATCH -t 1-00:00:00           # time in d-hh:mm:s
 #SBATCH -p general                # partition
-#SBATCH -q public            # QOS
+#SBATCH -q grp_asinghar           # QOS
 #SBATCH --gres=gpu:v100:2
-#SBATCH --constraint=v100_32
 #SBATCH --mem=80G
 #SBATCH -o logs/sl.%j.out         # file to save job's STDOUT (%j = JobId)
 #SBATCH -e logs/sl.%j.err         # file to save job's STDERR (%j = JobId)

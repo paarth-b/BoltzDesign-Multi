@@ -87,7 +87,7 @@ def distributed_worker(rank, world_size, port, args, config, output_dir, yaml_di
     os.environ['MASTER_PORT'] = str(port)
     dist.init_process_group(
         backend='nccl', rank=rank, world_size=world_size,
-        timeout=datetime.timedelta(minutes=5),
+        timeout=datetime.timedelta(minutes=60),
     )
 
     try:

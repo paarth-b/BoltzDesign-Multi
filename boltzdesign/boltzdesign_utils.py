@@ -1163,10 +1163,11 @@ def run_boltz_design(
     for directory in [results_yaml_dir, results_final_dir, results_yaml_dir_apo, results_final_dir_apo, loss_dir, animation_save_dir]:
         os.makedirs(directory, exist_ok=True)
 
-    # Save config
-    config_path = os.path.join(results_final_dir, 'config.yaml')
-    with open(config_path, 'w') as f:
-        yaml.dump(config, f)
+    # Save config (rank 0 only to avoid concurrent write race)
+    if rank == 0:
+        config_path = os.path.join(results_final_dir, 'config.yaml')
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
 
     alphabet = list('XXARNDCQEGHILKMFPSTWYV-')
     rmsd_csv_path = os.path.join(results_final_dir, 'rmsd_results.csv')
