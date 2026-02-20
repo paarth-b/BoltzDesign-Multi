@@ -30,6 +30,8 @@ import csv
 import gc
 import json
 import logging
+import fcntl
+import torch.distributed as dist
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -482,7 +484,11 @@ def boltz_hallucination(
     optimizer_type='SGD',
     save_trajectory=False,
     noise_scaling=0.1,
+    rank=0,
+    world_size=1,
 ):
+    device = next(boltz_model.parameters()).device
+    use_dist = world_size > 1 and dist.is_initialized()
 
     predict_args = {
         "recycling_steps": recycling_steps,  # Default value
@@ -511,7 +517,6 @@ def boltz_hallucination(
     # Parse all targets
     targets = [parse_boltz_schema(name, d, ccd_lib) for d in multi_state_data]
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     boltz_model.train() if set_train else boltz_model.eval()
     print(f"set in {'train' if set_train else 'eval'} mode")
 
@@ -575,66 +580,65 @@ def boltz_hallucination(
             batch['record'] = target.record
 
         return batch, structure
-    def validate_batch_devices(batch, device):
-        """Ensure all tensors in batch are on the same device"""
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                if value.device != device:
-                    print(f"Warning: {key} is on {value.device}, moving to {device}")
-                    batch[key] = value.to(device)
-        return batch
-    
-    # Generate batches for all states
+    # Each rank processes its subset of conformations (round-robin)
+    num_total_states = len(targets)
+    my_indices = [i for i in range(num_total_states) if i % world_size == rank]
     batches = []
     structures = []
-    for target in targets:
-        b, s = get_batch(target, max_seqs=msa_max_seqs, length=length, pocket_conditioning=pocket_conditioning)
+    for i in my_indices:
+        b, s = get_batch(targets[i], max_seqs=msa_max_seqs, length=length, pocket_conditioning=pocket_conditioning)
         b = {key: value.unsqueeze(0).to(device) for key, value in b.items()}
-        
         if 'msa_mask' in b:
             b['msa_mask'] = b['msa_mask'].float()
-        
         batches.append(b)
         structures.append(s)
-        
-    for i, b in enumerate(batches):
-        batches[i] = validate_batch_devices(b, device)
+    # Communicate total state count for proper loss averaging
+    if use_dist:
+        if len(targets) < world_size:
+            raise ValueError(
+                f"You have {len(targets)} conformation(s) but {world_size} GPU(s). "
+                f"Use at most {len(targets)} GPU(s), or provide more input conformations."
+            )
+        _count_t = torch.tensor([len(batches)], device=device, dtype=torch.float32)
+        dist.all_reduce(_count_t, op=dist.ReduceOp.SUM)
+        num_total_states = int(_count_t.item())
     # Use the first batch to initialize optimization variables
     # We assume the binder is the same chain ID and length across all states
     base_batch = batches[0]
-    
-    ## initialize res_type_logits
+
+    # Initialize res_type_logits on rank 0, then broadcast so all ranks start identically
     if pre_run:
-        # Initialize one set of logits shared across all states
         res_type_logits = base_batch['res_type'].clone().detach().to(device).float()
-        res_type_logits[base_batch['entity_id']==chain_to_number[binder_chain],:] = noise_scaling*torch.softmax(torch.distributions.Gumbel(0, 1).sample(base_batch['res_type'][base_batch['entity_id']==chain_to_number[binder_chain],:].shape).to(device) - torch.sum(torch.eye(base_batch['res_type'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10), dim=-1)
+        if rank == 0:
+            res_type_logits[base_batch['entity_id']==chain_to_number[binder_chain],:] = noise_scaling*torch.softmax(torch.distributions.Gumbel(0, 1).sample(base_batch['res_type'][base_batch['entity_id']==chain_to_number[binder_chain],:].shape).to(device) - torch.sum(torch.eye(base_batch['res_type'].shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10), dim=-1)
     else:
         res_type_logits = torch.from_numpy(input_res_type).to(device)
 
-    # Propagate initialization to all batches
+    if use_dist:
+        dist.broadcast(res_type_logits, src=0)
+
+    # The parameter to optimize — each rank has its own copy, kept in sync via all_reduce
+    res_type_logits = res_type_logits.clone().detach().requires_grad_(True)
     for b in batches:
-        b['res_type_logits'] = res_type_logits 
-        
+        b['res_type_logits'] = res_type_logits
+
         if non_protein_target:
-            b['msa'] = b['res_type_logits'].unsqueeze(0).to(device)
+            b['msa'] = res_type_logits.detach().unsqueeze(0)
             b['msa_paired'] = torch.ones(b['res_type'].shape[0], 1, b['res_type'].shape[1]).to(device)
             b['deletion_value'] = torch.zeros(b['res_type'].shape[0], 1, b['res_type'].shape[1]).to(device)
             b['has_deletion'] = torch.full((b['res_type'].shape[0], 1, b['res_type'].shape[1]), False).to(device)
             b['msa_mask'] = torch.ones(b['res_type'].shape[0], 1, b['res_type'].shape[1], dtype=torch.float32).to(device)
-            b['profile'] = b['msa'].float().mean(dim=0).to(device)
+            b['profile'] = b['msa'].float().mean(dim=0)
             b['deletion_mean'] = torch.zeros(b['deletion_mean'].shape).to(device)
             b['res_type'] = b['res_type'].float()
-
-    # The parameter to optimize is the shared logits tensor
-    batches[0]['res_type_logits'].requires_grad = True
-    optimizer = torch.optim.AdamW([batches[0]['res_type_logits']], lr=learning_rate_pre if pre_run else learning_rate) if optimizer_type == 'AdamW' else torch.optim.SGD([batches[0]['res_type_logits']], lr=learning_rate_pre if pre_run else learning_rate)
+    optimizer = torch.optim.AdamW([res_type_logits], lr=learning_rate_pre if pre_run else learning_rate) if optimizer_type == 'AdamW' else torch.optim.SGD([res_type_logits], lr=learning_rate_pre if pre_run else learning_rate)
 
     def norm_seq_grad(grad, chain_mask):
         chain_mask = chain_mask.bool()
         masked_grad = grad[:, chain_mask.squeeze(0), :] 
         eff_L = (masked_grad.pow(2).sum(-1, keepdim=True) > 0).sum(-2, keepdim=True)
         gn = masked_grad.norm(dim=(-1, -2), keepdim=True) 
-        return grad * torch.sqrt(torch.tensor(eff_L)) / (gn + 1e-7)
+        return grad * torch.sqrt(eff_L.float()) / (gn + 1e-7)
 
     alphabet = list('XXARNDCQEGHILKMFPSTWYV-')
     best_loss = float('inf')  
@@ -698,137 +702,20 @@ def boltz_hallucination(
 
         prev_sequence=""
         
-        # Modified to average loss over all states
         def get_model_loss(batches, plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, pre_run=False, mask_ligand=False, distogram_only=False, predict_args=None, loss_scales=None, binder_chain='A', increasing_contact_over_itr=False, optimize_contact_per_binder_pos=False, num_inter_contacts=2, num_intra_contacts=4,  num_optimizing_binder_pos =1, inter_chain_cutoff=21.0, intra_chain_cutoff=14.0, save_trajectory=False):
             traj_coords = None
             traj_plddt = None
-            
-            total_loss_all = 0
-            losses_accumulated = {
-                'con_loss': 0, 'i_con_loss': 0, 'helix_loss': 0,
-                'plddt_loss': 0, 'i_pae_loss': 0, 'pae_loss': 0, 'rg_loss': 0
+
+            losses_scalar = {
+                'con_loss': 0.0, 'i_con_loss': 0.0, 'helix_loss': 0.0,
+                'plddt_loss': 0.0, 'i_pae_loss': 0.0, 'pae_loss': 0.0, 'rg_loss': 0.0
             }
-            
-            # Loop over all states/batches
-            for b_idx, batch in enumerate(batches):
-                chain_mask = chain_masks[b_idx]
-                print(f"Batch {b_idx} msa_mask shape: {batch.get('msa_mask', 'NOT FOUND')}")
-                if 'msa_mask' in batch:
-                    print(f"  dtype: {batch['msa_mask'].dtype}, device: {batch['msa_mask'].device}")
-                    # Force to float32
-                    batch['msa_mask'] = batch['msa_mask'].float()
-                # Handle masking first if needed
-                if pre_run and mask_ligand:
-                    batch['token_pad_mask'][batch['entity_id']!=chain_to_number[binder_chain]]=0
-                    masked_token_to_rep = torch.ones_like(batch['token_to_rep_atom'])
-                    masked_token_to_rep[batch['entity_id']==chain_to_number[binder_chain],:] = 0
-                    masked_token_to_rep_index = torch.nonzero(batch['token_to_rep_atom']*masked_token_to_rep, as_tuple=True)[2]
-                    batch['atom_pad_mask'][:, masked_token_to_rep_index] = 0
-
-                # Common arguments for get_distogram_confidence
-                confidence_args = {
-                    'recycling_steps': predict_args["recycling_steps"],
-                    'num_sampling_steps': predict_args["sampling_steps"],
-                    'multiplicity_diffusion_train': 1,
-                    'diffusion_samples': predict_args["diffusion_samples"],
-                    'run_confidence_sequentially': True,
-                    'disconnect_feats': disconnect_feats,
-                    'disconnect_pairformer': disconnect_pairformer
-                }
-
-                if save_trajectory and b_idx == 0: # Only save trajectory for first state to save memory/complexity
-                    # Get model output with trajectory info
-                    dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
-                    traj_coords = dict_out['sample_atom_coords'][0].detach().cpu().numpy()
-                    traj_plddt = dict_out['plddt'][0].detach().cpu().numpy()
-                else:
-                    # Get model output without trajectory
-                    if pre_run or distogram_only:
-                        dict_out, s, z, s_inputs = boltz_model.get_distogram(batch)
-                    else:
-                        dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
-
-
-                pdist = dict_out['pdistogram']
-                mid_pts = get_mid_points(pdist).to(device)
-
-                # Calculate contact losses
-                con_loss = get_con_loss(pdist, mid_pts,
-                                        num=num_intra_contacts, seqsep=9, cutoff=intra_chain_cutoff,
-                                        binary=False,
-                                        mask_1d=chain_mask, mask_1b=chain_mask)
-
-                if optimize_contact_per_binder_pos:
-                    if increasing_contact_over_itr:
-                        num_optimizing_binder_pos_curr = 0 if pre_run else num_optimizing_binder_pos
-                        i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0, num_pos=num_optimizing_binder_pos_curr,
-                                                cutoff=inter_chain_cutoff, binary=False, 
-                                                mask_1d=chain_mask, mask_1b=1-chain_mask)
-                    else:
-                        i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0,
-                                                cutoff=inter_chain_cutoff, binary=False, 
-                                                mask_1d=chain_mask, mask_1b=1-chain_mask)
-
-                else:
-            
-                    i_con_loss = get_con_loss(pdist, mid_pts,
-                                                num=num_inter_contacts, seqsep=0, 
-                                                cutoff=inter_chain_cutoff, binary=False, 
-                                                mask_1d=1-chain_mask, mask_1b=chain_mask)
-
-
-                mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
-                helix_loss = _get_helix_loss(pdist, mid_pts,
-                                        offset=None, mask_2d=mask_2d, binary=True)
-
-
-                losses = {}
-                losses['con_loss'] = con_loss
-                losses['helix_loss'] = helix_loss
-                if not (pre_run and mask_ligand):
-                    losses['i_con_loss'] = i_con_loss         
-
-                if not pre_run and not distogram_only:
-                    plddt_loss = get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask)
-                    pae = (dict_out['pae'] + dict_out['pae'].transpose(-2,-1))/2
-                    i_pae_loss = get_pae_loss(pae, mask_1d=1-chain_mask, mask_1b=chain_mask)
-                    pae_loss = get_pae_loss(pae, mask_1d=chain_mask, mask_1b=chain_mask)
-                    rg_loss, rg = add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain)
-
-                    losses.update({
-                        'plddt_loss': plddt_loss,
-                        'i_pae_loss': i_pae_loss,
-                        'pae_loss': pae_loss,
-                        'rg_loss': rg_loss
-                    })
-                
-                # Accumulate weighted losses
-                for k, v in losses.items():
-                    if k in losses_accumulated:
-                         losses_accumulated[k] += v
-
-                # Visualization data (only from first state to keep clean)
-                if b_idx == 0:
-                     bins = mid_points < 8.0
-                     px = torch.sum(torch.softmax(dict_out['pdistogram'], dim=-1)[:,:,:,bins], dim=-1)
-                     plots.append(px[0].detach().cpu().numpy())
-                     
-                     # Store single-state metrics for history just to track progress
-                     distogram_history.append(px[0].detach().cpu().numpy())
-                     # We use the sequence from the shared logits, so it's the same
-                     sequence_history.append(batch['res_type'][0, :, 2:22].detach().cpu().numpy())
-
-
-            # Average losses across all states
-            num_states = len(batches)
-            avg_losses = {k: v / num_states for k, v in losses_accumulated.items()}
+            total_loss_scalar = 0.0
 
             if loss_scales is None:
                 loss_scales = {
                     'con_loss': 1.0,
-                    'i_con_loss': 1.0, 
+                    'i_con_loss': 1.0,
                     'helix_loss': random.uniform(-0.4, 0.0),
                     'plddt_loss': 0.1,
                     'pae_loss': 0.4,
@@ -836,24 +723,127 @@ def boltz_hallucination(
                     'rg_loss': 0.0,
                 }
 
-            # Calculate total loss
-            total_loss = sum(loss * loss_scales[name] for name, loss in avg_losses.items() if loss != 0)
-            
-            # Update history lists
-            loss_history.append(total_loss.item())
-            i_con_loss_history.append(avg_losses['i_con_loss'].item() if torch.is_tensor(avg_losses['i_con_loss']) else avg_losses['i_con_loss'])
-            con_loss_history.append(avg_losses['con_loss'].item())
-            if not pre_run and not distogram_only:
-                 plddt_loss_history.append(avg_losses['plddt_loss'].item())
-            
-            loss_str = [f"{k}:{v.item():.2f}" for k,v in avg_losses.items() if torch.is_tensor(v) and v != 0]
+            confidence_args = {
+                'recycling_steps': predict_args["recycling_steps"],
+                'num_sampling_steps': predict_args["sampling_steps"],
+                'multiplicity_diffusion_train': 1,
+                'diffusion_samples': predict_args["diffusion_samples"],
+                'run_confidence_sequentially': True,
+                'disconnect_feats': disconnect_feats,
+                'disconnect_pairformer': disconnect_pairformer
+            }
 
-            return total_loss, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
+            # Sequential forward + per-conformation backward to minimize peak GPU memory.
+            # Each conformation's graph is freed immediately after its backward pass,
+            # so only one computation graph is ever held in memory at a time.
+            for b_idx, batch in enumerate(batches):
+                chain_mask = chain_masks[b_idx]
+                if 'msa_mask' in batch:
+                    batch['msa_mask'] = batch['msa_mask'].float()
+                if pre_run and mask_ligand:
+                    batch['token_pad_mask'][batch['entity_id']!=chain_to_number[binder_chain]]=0
+                    masked_token_to_rep = torch.ones_like(batch['token_to_rep_atom'])
+                    masked_token_to_rep[batch['entity_id']==chain_to_number[binder_chain],:] = 0
+                    masked_token_to_rep_index = torch.nonzero(batch['token_to_rep_atom']*masked_token_to_rep, as_tuple=True)[2]
+                    batch['atom_pad_mask'][:, masked_token_to_rep_index] = 0
+
+                is_global_first = (rank == 0 and b_idx == 0)
+
+                if save_trajectory and is_global_first:
+                    dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
+                    traj_coords = dict_out['sample_atom_coords'][0].detach().cpu().numpy()
+                    traj_plddt = dict_out['plddt'][0].detach().cpu().numpy()
+                else:
+                    if pre_run or distogram_only:
+                        dict_out, s, z, s_inputs = boltz_model.get_distogram(batch)
+                    else:
+                        dict_out = boltz_model.get_distogram_confidence(batch, **confidence_args)
+
+                pdist = dict_out['pdistogram']
+                mid_pts = get_mid_points(pdist).to(device)
+
+                con_loss = get_con_loss(pdist, mid_pts,
+                                        num=num_intra_contacts, seqsep=9, cutoff=intra_chain_cutoff,
+                                        binary=False, mask_1d=chain_mask, mask_1b=chain_mask)
+
+                if optimize_contact_per_binder_pos:
+                    num_pos = (0 if pre_run else num_optimizing_binder_pos) if increasing_contact_over_itr else None
+                    i_con_loss = get_con_loss(pdist, mid_pts,
+                                            num=num_inter_contacts, seqsep=0,
+                                            **(dict(num_pos=num_pos) if num_pos is not None else {}),
+                                            cutoff=inter_chain_cutoff, binary=False,
+                                            mask_1d=chain_mask, mask_1b=1-chain_mask)
+                else:
+                    i_con_loss = get_con_loss(pdist, mid_pts,
+                                            num=num_inter_contacts, seqsep=0,
+                                            cutoff=inter_chain_cutoff, binary=False,
+                                            mask_1d=1-chain_mask, mask_1b=chain_mask)
+
+                mask_2d = chain_mask[:, :, None] * chain_mask[:, None, :]
+                helix_loss = _get_helix_loss(pdist, mid_pts, offset=None, mask_2d=mask_2d, binary=True)
+
+                losses = {'con_loss': con_loss, 'helix_loss': helix_loss}
+                if not (pre_run and mask_ligand):
+                    losses['i_con_loss'] = i_con_loss
+                if not pre_run and not distogram_only:
+                    pae = (dict_out['pae'] + dict_out['pae'].transpose(-2,-1))/2
+                    losses.update({
+                        'plddt_loss': get_plddt_loss(dict_out['plddt'], mask_1d=chain_mask),
+                        'i_pae_loss': get_pae_loss(pae, mask_1d=1-chain_mask, mask_1b=chain_mask),
+                        'pae_loss': get_pae_loss(pae, mask_1d=chain_mask, mask_1b=chain_mask),
+                        'rg_loss': add_rg_loss(dict_out['sample_atom_coords'], batch, length, binder_chain=binder_chain)[0]
+                    })
+
+                state_loss = sum(loss * loss_scales[name] for name, loss in losses.items() if loss != 0)
+
+                with torch.no_grad():
+                    total_loss_scalar += state_loss.item() / num_total_states
+                    for k, v in losses.items():
+                        if k in losses_scalar and torch.is_tensor(v) and v != 0:
+                            losses_scalar[k] += v.item() / num_total_states
+
+                # Visualization data (only from global first state = rank 0, batch 0)
+                if is_global_first:
+                    bins = mid_points < 8.0
+                    px = torch.sum(torch.softmax(pdist.detach(), dim=-1)[:,:,:,bins], dim=-1)
+                    plots.append(px[0].cpu().numpy())
+                    distogram_history.append(px[0].cpu().numpy())
+                    sequence_history.append(batch['res_type'][0, :, 2:22].detach().cpu().numpy())
+
+                # Per-conformation backward: divide by num_total_states so gradients
+                # accumulate to the correct average across all ranks/conformations.
+                # retain_graph=True for all but the last batch because all batches
+                # share the same res_type tensor (from update_sequence), so the
+                # res_type → res_type_logits path must stay alive until the final backward.
+                is_last_batch = (b_idx == len(batches) - 1)
+                (state_loss / num_total_states).backward(retain_graph=not is_last_batch)
+
+                del state_loss, dict_out, pdist, mid_pts, losses
+                if not pre_run and not distogram_only:
+                    del pae
+                torch.cuda.empty_cache()
+
+            # Synchronize gradients across ranks
+            if use_dist:
+                if res_type_logits.grad is None:
+                    res_type_logits.grad = torch.zeros_like(res_type_logits)
+                dist.all_reduce(res_type_logits.grad, op=dist.ReduceOp.SUM)
+
+            torch.cuda.empty_cache()
+
+            loss_history.append(total_loss_scalar)
+            i_con_loss_history.append(losses_scalar['i_con_loss'])
+            con_loss_history.append(losses_scalar['con_loss'])
+            if not pre_run and not distogram_only:
+                 plddt_loss_history.append(losses_scalar['plddt_loss'])
+
+            loss_str = [f"{k}:{v:.2f}" for k,v in losses_scalar.items() if v != 0]
+
+            return total_loss_scalar, plots, loss_history, i_con_loss_history, con_loss_history, distogram_history, sequence_history, plddt_loss_history, loss_str, traj_coords, traj_plddt
         
         def update_sequence(opt, batches, mask, alpha=2.0, non_protein_target=False, binder_chain='A'):
-            # The logic here updates the SHARED logits. 
             shared_logits = batches[0]['res_type_logits']
-            
+
             scaled_logits = alpha * shared_logits
             X = scaled_logits - torch.sum(torch.eye(scaled_logits.shape[-1])[[0,1,6,22,23,24,25,26,27,28,29,30,31,32]],dim=0).to(device)*(1e10)
             soft = torch.softmax(X/opt["temp"],dim=-1)
@@ -862,8 +852,8 @@ def boltz_hallucination(
             pseudo = opt["soft"] * soft + (1-opt["soft"]) * shared_logits
             pseudo = opt["hard"] * hard + (1-opt["hard"]) * pseudo
             res_type = pseudo*mask + shared_logits*(1-mask)
-            
-            # Apply to all batches
+
+            # All local batches are on the same device
             for b in batches:
                 b['logits'] = scaled_logits
                 b['soft'] = soft
@@ -872,13 +862,13 @@ def boltz_hallucination(
                 b['res_type'] = res_type
                 if 'msa_mask' in b:
                     b['msa_mask'] = b['msa_mask'].float()
-                    
+
                 if non_protein_target:
-                    b['msa'] = b['res_type'].unsqueeze(0).to(device).detach()
-                    b['profile'] = b['msa'].float().mean(dim=0).to(device).detach()
+                    b['msa'] = b['res_type'].unsqueeze(0).detach()
+                    b['profile'] = b['msa'].float().mean(dim=0).detach()
                 else:
-                    b['msa'][:,0,:,:] = b['res_type'].to(device).detach()
-                    b['profile'][b['entity_id']==chain_to_number[binder_chain],:] = b['msa'][:, 0, (b['entity_id']==chain_to_number[binder_chain])[0],:].float().mean(dim=1).to(device).detach()
+                    b['msa'][:,0,:,:] = b['res_type'].detach()
+                    b['profile'][b['entity_id']==chain_to_number[binder_chain],:] = b['msa'][:, 0, (b['entity_id']==chain_to_number[binder_chain])[0],:].float().mean(dim=1).detach()
 
             return batches
         
@@ -915,24 +905,22 @@ def boltz_hallucination(
                 diff_count = sum(1 for a, b in zip(current_sequence, prev_sequence) if a != b)
                 diff_percentage = (diff_count / length) * 100
             prev_sequence = current_sequence
-            
-            # Backpropagate
-            total_loss.backward()
-            
-            # Apply gradients to the shared parameter (batches[0]['res_type_logits'])
-            if batches[0]['res_type_logits'].grad is not None:
-                batches[0]['res_type_logits'].grad[batches[0]['entity_id']!=chain_to_number[binder_chain],:] = 0
-                batches[0]['res_type_logits'].grad[..., [0,1,6,22,23,24,25,26,27,28,29,30,31,32]] = 0
-                batches[0]['res_type_logits'].grad = norm_seq_grad(batches[0]['res_type_logits'].grad, chain_masks[0]) # Assuming binder mask is same for normalization
+
+            # Backward + all_reduce already done inside get_model_loss.
+            # Apply gradient masking and normalization, then optimizer step.
+            if res_type_logits.grad is not None:
+                res_type_logits.grad[batches[0]['entity_id']!=chain_to_number[binder_chain],:] = 0
+                res_type_logits.grad[..., [0,1,6,22,23,24,25,26,27,28,29,30,31,32]] = 0
+                res_type_logits.grad = norm_seq_grad(res_type_logits.grad, chain_masks[0])
                 optimizer.step()
                 optimizer.zero_grad()
-                current_lr = optimizer.param_groups[0]['lr']
-                print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss.item():.2f}, {loss_str}")
+                if rank == 0:
+                    current_lr = optimizer.param_groups[0]['lr']
+                    print(f"Epoch {i}: lr: {current_lr:.3f}, soft: {opt['soft']:.2f}, hard: {opt['hard']:.2f}, temp: {opt['temp']:.2f}, total loss: {total_loss:.2f}, {loss_str}")
         
         return batches[0], plots, loss_history, i_con_loss_history, con_loss_history, plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list
 
     if pre_run:
-        # Pass the list of batches
         best_batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list = design(batches, iters=pre_iteration, soft=1.0, mask=mask, chain_masks=chain_masks, learning_rate=learning_rate_pre, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, mask_ligand=mask_ligand, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
     else:
         if design_algorithm == "3stages":
@@ -945,11 +933,14 @@ def boltz_hallucination(
             print('-'*100)
             print("set res_type_logits to logits")
             
-            # Re-initialize optimizer for the new phase on the shared tensor
-            new_logits = (alpha * batches[0]["res_type_logits"]).clone().detach().requires_grad_(True)
-            for b in batches: b['res_type_logits'] = new_logits
-            optimizer = torch.optim.SGD([batches[0]['res_type_logits']], lr=learning_rate)
-            
+            # Re-initialize logits for phase transition; broadcast for FP safety
+            res_type_logits = (alpha * batches[0]["res_type_logits"]).clone().detach()
+            if use_dist:
+                dist.broadcast(res_type_logits, src=0)
+            res_type_logits.requires_grad_(True)
+            for b in batches: b['res_type_logits'] = res_type_logits
+            optimizer = torch.optim.SGD([res_type_logits], lr=learning_rate)
+
             best_batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list2, traj_plddt_list2 = design(batches, iters=temp_iteration, soft=1.0, temp = 1.0,e_temp=0.01, num_optimizing_binder_pos=8, e_num_optimizing_binder_pos=12,  mask=mask, chain_masks=chain_masks, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
             print('-'*100)
             print("hard")
@@ -959,7 +950,6 @@ def boltz_hallucination(
             traj_plddt_list = traj_plddt_list1 + traj_plddt_list2 + traj_plddt_list3 if save_trajectory else []
 
         elif design_algorithm == "3stages_extra":
-            # (Similar updates for 3stages_extra - logic is identical, just parameter differences)
             print('-'*100)
             print(f"logits to softmax(T={e_soft_1})")
             print('-'*100)
@@ -973,10 +963,13 @@ def boltz_hallucination(
             print('-'*100)
             print("set res_type_logits to logits")
             
-            new_logits = (alpha * batches[0]["res_type_logits"]).clone().detach().requires_grad_(True)
-            for b in batches: b['res_type_logits'] = new_logits
-            optimizer = torch.optim.SGD([batches[0]['res_type_logits']], lr=learning_rate)
-            
+            res_type_logits = (alpha * batches[0]["res_type_logits"]).clone().detach()
+            if use_dist:
+                dist.broadcast(res_type_logits, src=0)
+            res_type_logits.requires_grad_(True)
+            for b in batches: b['res_type_logits'] = res_type_logits
+            optimizer = torch.optim.SGD([res_type_logits], lr=learning_rate)
+
             best_batch, plots, loss_history, i_con_loss_history, con_loss_history,plddt_loss_history, distogram_history, sequence_history, traj_coords_list3, traj_plddt_list3 = design(batches, iters=temp_iteration, soft=1.0, temp = 1.0,e_temp=0.01, num_optimizing_binder_pos=8, e_num_optimizing_binder_pos=12,  mask=mask, chain_masks=chain_masks, learning_rate=learning_rate, length=length, plots=plots, loss_history=loss_history, i_con_loss_history=i_con_loss_history, con_loss_history=con_loss_history, plddt_loss_history=plddt_loss_history, distogram_history=distogram_history, sequence_history=sequence_history, pre_run=pre_run, distogram_only=distogram_only, predict_args=predict_args, loss_scales=loss_scales, binder_chain=binder_chain, increasing_contact_over_itr=increasing_contact_over_itr, optimize_contact_per_binder_pos=optimize_contact_per_binder_pos, non_protein_target=non_protein_target, inter_chain_cutoff=inter_chain_cutoff, intra_chain_cutoff=intra_chain_cutoff, num_inter_contacts=num_inter_contacts, num_intra_contacts=num_intra_contacts, save_trajectory=save_trajectory)
             print('-'*100)
             print("hard")
@@ -1065,23 +1058,24 @@ def boltz_hallucination(
         return new_batches, new_batches_apo, new_structures, new_structures_apo
         
     initial_structure_template = structures[0]
-    batches, batches_apo, structures, structures_apo = _update_batches_all(multi_state_data, multi_state_data_apo)
-    
-    # Run final prediction on all states
-    outputs = [_run_model(boltz_model, b, predict_args) for b in batches]
-    outputs_apo = [_run_model(boltz_model, b_apo, predict_args) for b_apo in batches_apo]
 
-    # For compatibility, return the result of the first state as "output"
-    output = outputs[0]
-    output_apo = outputs_apo[0]
-    best_batch = batches[0]
-    best_batch_apo = batches_apo[0]
-    best_structure = structures[0]
-    best_structure_apo = structures_apo[0]
-
-    # Calculate average iptm across states for greedy steps
-    avg_iptm = np.mean([o['iptm'].detach().cpu().numpy() for o in outputs])
-    print(f"best design avg iptm: {avg_iptm}")
+    # Final prediction is only needed on rank 0 — all result saving/printing
+    # downstream is gated on rank == 0, so non-zero ranks can skip this work.
+    if rank == 0:
+        batches, batches_apo, structures, structures_apo = _update_batches_all(multi_state_data, multi_state_data_apo)
+        outputs     = [_run_model(boltz_model, b,     predict_args) for b     in batches]
+        outputs_apo = [_run_model(boltz_model, b_apo, predict_args) for b_apo in batches_apo]
+        output          = outputs[0]
+        output_apo      = outputs_apo[0]
+        best_batch      = batches[0]
+        best_batch_apo  = batches_apo[0]
+        best_structure  = structures[0]
+        best_structure_apo = structures_apo[0]
+        avg_iptm = np.mean([o['iptm'].detach().cpu().numpy() for o in outputs])
+        print(f"best design avg iptm: {avg_iptm}")
+    else:
+        output = output_apo = best_batch = best_batch_apo = None
+        best_structure = best_structure_apo = None
 
     # Not implementing semi-greedy for multi-state in this block to keep it concise, 
     # assuming initial design is sufficient. If needed, the loop would average scores.
@@ -1094,14 +1088,15 @@ def run_boltz_design(
     yaml_dir,
     boltz_model,
     ccd_path,
-    design_samples =1,
+    design_samples=1,
     version_name=None,
     config=None,
     loss_scales=None,
-    num_workers=1,
     show_animation=False,
     save_trajectory=False,
     redo_boltz_predict=True,
+    rank=0,
+    world_size=1,
 ):
     """
     Run Boltz protein design pipeline.
@@ -1193,18 +1188,25 @@ def run_boltz_design(
              yaml_groups[base_name] = []
         yaml_groups[base_name].append(yaml_path)
 
+    use_dist = world_size > 1 and dist.is_initialized()
+
     for target_binder_input, yaml_path_list in yaml_groups.items():
-            # Sort to ensure consistent order
-            yaml_path_list.sort() 
-            print(f"Processing target {target_binder_input} with input files: {[p.name for p in yaml_path_list]}")
+            yaml_path_list.sort()
+            if rank == 0:
+                print(f"Processing target {target_binder_input} with input files: {[p.name for p in yaml_path_list]}")
 
             for itr in range(design_samples):
+                # Sync random seeds so all ranks draw identical length/helix_loss
+                seed = hash((target_binder_input, itr)) % (2**31)
+                random.seed(seed)
+                np.random.seed(seed)
+
                 config['length'] = random.randint(config['length_min'],config['length_max'])
                 filtered_config['length'] = config['length']
                 loss_scales['helix_loss'] = random.uniform(config['helix_loss_min'], config['helix_loss_max'])
 
-                print('pre-run warm up')
-                # Pass list of paths for multi-state
+                if rank == 0:
+                    print('pre-run warm up')
                 input_res_type, plots, loss_history, distogram_history, sequence_history, traj_coords_list, traj_plddt_list = boltz_hallucination(
                     boltz_model,
                     yaml_path_list,
@@ -1214,9 +1216,12 @@ def run_boltz_design(
                     input_res_type=False,
                     loss_scales=loss_scales,
                     chain_to_number=chain_to_number,
-                    save_trajectory=save_trajectory
+                    save_trajectory=save_trajectory,
+                    rank=rank,
+                    world_size=world_size,
                 )
-                print('warm up done')      
+                if rank == 0:
+                    print('warm up done')
                 output, output_apo, best_batch, best_batch_apo, best_structure, best_structure_apo ,distogram_history_2, sequence_history_2, loss_history_2, con_loss_history, i_con_loss_history, plddt_loss_history, traj_coords_list_2, traj_plddt_list_2, structure = boltz_hallucination(
                     boltz_model,
                     yaml_path_list,
@@ -1226,152 +1231,144 @@ def run_boltz_design(
                     input_res_type=input_res_type,
                     loss_scales=loss_scales,
                     chain_to_number=chain_to_number,
-                    save_trajectory=save_trajectory
+                    save_trajectory=save_trajectory,
+                    rank=rank,
+                    world_size=world_size,
                 )
-                loss_history.extend(loss_history_2)
-                distogram_history.extend(distogram_history_2) 
-                sequence_history.extend(sequence_history_2)
-                traj_coords_list.extend(traj_coords_list_2)
-                traj_plddt_list.extend(traj_plddt_list_2)
+                # Only rank 0 handles result saving, plotting, and validation
+                if rank == 0:
+                    loss_history.extend(loss_history_2)
+                    distogram_history.extend(distogram_history_2)
+                    sequence_history.extend(sequence_history_2)
+                    traj_coords_list.extend(traj_coords_list_2)
+                    traj_plddt_list.extend(traj_plddt_list_2)
 
-                if save_trajectory:
-                    from logmd import LogMD
-                    logmd = LogMD() 
-                    logmd.notebook()
-                    print(logmd.url) 
-                    atoms = structure.atoms
-                    ref_coords = traj_coords_list[-1][:atoms['coords'].shape[0], :]
-                    for i in range(len(traj_coords_list)):
-                        current_coords = traj_coords_list[i][:atoms['coords'].shape[0], :]
-                        aligned_coords = align_points(current_coords, ref_coords)
-                        structure.atoms['coords'] = aligned_coords
-                        structure.atoms["is_present"] = True
-                        pdb_str = to_pdb(structure, plddts=traj_plddt_list[i])
-                        pdb_str = "\n".join([line for line in pdb_str.split("\n") if line.startswith("ATOM") or line.startswith("HETATM")])
-                        logmd(pdb_str)
+                    if save_trajectory:
+                        from logmd import LogMD
+                        logmd = LogMD()
+                        logmd.notebook()
+                        print(logmd.url)
+                        atoms = structure.atoms
+                        ref_coords = traj_coords_list[-1][:atoms['coords'].shape[0], :]
+                        for i in range(len(traj_coords_list)):
+                            current_coords = traj_coords_list[i][:atoms['coords'].shape[0], :]
+                            aligned_coords = align_points(current_coords, ref_coords)
+                            structure.atoms['coords'] = aligned_coords
+                            structure.atoms["is_present"] = True
+                            pdb_str = to_pdb(structure, plddts=traj_plddt_list[i])
+                            pdb_str = "\n".join([line for line in pdb_str.split("\n") if line.startswith("ATOM") or line.startswith("HETATM")])
+                            logmd(pdb_str)
 
-                print('-' * 100)
-                print(f"Holo Protein PLDDT: {output['plddt'][:config['length']].mean():.3f}")
-                print(f"Apo Protein PLDDT: {output_apo['plddt'][:config['length']].mean():.3f}")
-                print('-' * 100)
-                print(f"Holo Complex PLDDT: {float(output['complex_plddt'].detach().cpu().numpy()):.3f}")
-                print(f"Apo Complex PLDDT: {float(output_apo['complex_plddt'].detach().cpu().numpy()):.3f}")
-                print('-' * 100)
+                    print('-' * 100)
+                    print(f"Holo Protein PLDDT: {output['plddt'][:config['length']].mean():.3f}")
+                    print(f"Apo Protein PLDDT: {output_apo['plddt'][:config['length']].mean():.3f}")
+                    print('-' * 100)
+                    print(f"Holo Complex PLDDT: {float(output['complex_plddt'].detach().cpu().numpy()):.3f}")
+                    print(f"Apo Complex PLDDT: {float(output_apo['complex_plddt'].detach().cpu().numpy()):.3f}")
+                    print('-' * 100)
 
-                ca_coords = get_ca_coords(output['coords'], best_batch, binder_chain=config['binder_chain']).detach().cpu().numpy()
-                ca_coords_apo = get_ca_coords(output_apo['coords'], best_batch_apo, binder_chain='A').detach().cpu().numpy()
+                    ca_coords = get_ca_coords(output['coords'], best_batch, binder_chain=config['binder_chain']).detach().cpu().numpy()
+                    ca_coords_apo = get_ca_coords(output_apo['coords'], best_batch_apo, binder_chain='A').detach().cpu().numpy()
 
-                rmsd = np_rmsd(ca_coords, ca_coords_apo)
-                print('-' * 100)
-                print("rmsd", rmsd)
-                print('-' * 100) 
+                    rmsd = np_rmsd(ca_coords, ca_coords_apo)
+                    print('-' * 100)
+                    print("rmsd", rmsd)
+                    print('-' * 100)
 
-                if loss_dir:
-                    os.makedirs(loss_dir, exist_ok=True)
-                # Plot loss history
-                try:
-                    # Create figure with a dark background style
-                    plt.style.use('dark_background')
-                    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12,4))
-                    fig.patch.set_facecolor('#1C1C1C')
-                    
-                    # Custom colors for each plot
-                    colors = ['#00ff99', '#ff3366', '#3366ff']
-                    
-                    # Plot 1: Training Loss
-                    ax1.plot(loss_history, color=colors[0], linewidth=2)
-                    ax1.set_xlabel('Epochs', fontsize=12)
-                    ax1.set_ylabel('Total Loss', fontsize=12)
-                    ax1.set_title('Total Loss History', fontsize=14, pad=15)
-                    ax1.grid(True, linestyle='--', alpha=0.3)
-                    
-                    # Plot 2: Con Loss
-                    ax2.plot(con_loss_history, color=colors[1],linewidth=2) 
-                    ax2.set_xlabel('Epochs', fontsize=12) 
-                    ax2.set_ylabel('Intra-Contact Loss', fontsize=12) 
-                    ax2.set_title('Intra-Contact Loss History', fontsize=14, pad=15) 
-                    ax2.grid(True, linestyle='--', alpha=0.3)
-
-                    # Plot 3: iCon Loss
-                    ax3.plot(i_con_loss_history, color=colors[2], linewidth=2)
-                    ax3.set_xlabel('Epochs', fontsize=12)
-                    ax3.set_ylabel('Inter-Contact Loss', fontsize=12)
-                    ax3.set_title('Inter-Contact Loss History', fontsize=14, pad=15)
-                    ax3.grid(True, linestyle='--', alpha=0.3)
-                    
-                    # Adjust layout and add spacing between subplots
-                    plt.tight_layout(pad=3.0)
-                    
                     if loss_dir:
-                        plt.savefig(os.path.join(loss_dir, f'{target_binder_input}_loss_history_itr{itr + 1}_length{config["length"]}.png'),
-                                  facecolor='#1C1C1C', edgecolor='none', bbox_inches='tight', dpi=300)
-                    plt.show()
-                    plt.close()
+                        os.makedirs(loss_dir, exist_ok=True)
+                    try:
+                        plt.style.use('dark_background')
+                        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(12,4))
+                        fig.patch.set_facecolor('#1C1C1C')
+                        colors = ['#00ff99', '#ff3366', '#3366ff']
 
-                    distogram_ani, sequence_ani = visualize_training_history(best_batch, loss_history, sequence_history, distogram_history, config["length"], binder_chain=config['binder_chain'], save_dir=animation_save_dir, save_filename=f"{target_binder_input}_itr{itr + 1}_length{config['length']}")
-                    if show_animation:
-                        from IPython.display import display, HTML
-                        display(HTML(f"<div style='display:flex;gap:10px'><div style='flex:0.4'>{distogram_ani.to_jshtml()}</div><div style='flex:0.6'>{sequence_ani.to_jshtml()}</div></div>"))
+                        ax1.plot(loss_history, color=colors[0], linewidth=2)
+                        ax1.set_xlabel('Epochs', fontsize=12)
+                        ax1.set_ylabel('Total Loss', fontsize=12)
+                        ax1.set_title('Total Loss History', fontsize=14, pad=15)
+                        ax1.grid(True, linestyle='--', alpha=0.3)
 
-                except Exception as e:
-                    print(f"Error plotting loss history: {str(e)}")
-                    # import traceback
-                    # traceback.print_exc()
-                    continue
-    
-                with open(rmsd_csv_path, 'a', newline='') as f:
-                    writer = csv.writer(f)
-                    if not csv_exists:
-                        writer.writerow(['target', 'length', 'iteration', 'apo_holo_rmsd', 'complex_plddt', 'iptm',  'helix_loss'])
-                        csv_exists = True
-                    writer.writerow([target_binder_input, config['length'], itr + 1, rmsd, output['complex_plddt'].item(), output['iptm'].item(), loss_scales['helix_loss']])
-    
-                best_batch_cpu = {k: v.detach().cpu().numpy() if torch.is_tensor(v) else v for k, v in best_batch.items()}
-                best_sequence = ''.join([alphabet[i] for i in np.argmax(best_batch_cpu['res_type'][best_batch_cpu['entity_id']==chain_to_number[config['binder_chain']],:], axis=-1)])
-                print("best_sequence", best_sequence)
-                
-                # Save results for all states in the group
-                for yp in yaml_path_list:
-                    # Construct output filename based on original stem to preserve state info (e.g. 5zmc_0 -> 5zmc_0_results...)
-                    out_name = f"{yp.stem}_results_itr{itr + 1}_length{config['length']}.yaml"
-                    result_yaml = os.path.join(results_yaml_dir, out_name)
-                    result_yaml_apo = os.path.join(results_yaml_dir_apo, out_name)
-    
-                    shutil.copy2(yp, result_yaml)
-                    with open(result_yaml, 'r') as f:
-                        data = yaml.safe_load(f)
-                    
-                    chain_num = chain_to_number[config['binder_chain']]
-                    data['sequences'][chain_num]['protein']['sequence'] = best_sequence
-                    data.pop('constraints', None)
-    
-                    # Convert any MSA files from npz to a3m format
-                    for seq in data['sequences']:
-                        if 'protein' in seq and 'msa' in seq['protein'] and seq['protein']['msa']:
-                            seq['protein']['msa'] = seq['protein']['msa'].replace('.npz', '.a3m')
-    
-                    with open(result_yaml, 'w') as f:
-                        yaml.dump(data, f)
-    
-                    shutil.copy2(result_yaml, result_yaml_apo)
-                    with open(result_yaml_apo, 'r') as f:
-                        data_apo = yaml.safe_load(f)
-                    
-                    # Create Apo (only binder)
-                    data_apo['sequences'] = [data_apo['sequences'][chain_num]]
-                    data_apo.pop('constraints', None)   
-    
-                    with open(result_yaml_apo, 'w') as f:
-                        yaml.dump(data_apo, f)
-    
-                    if redo_boltz_predict:
-                        subprocess.run([boltz_path, 'predict', str(result_yaml), '--out_dir', str(results_final_dir), '--write_full_pae'], check=False)                      
-                        subprocess.run([boltz_path, 'predict', str(result_yaml_apo), '--out_dir', str(results_final_dir_apo), '--write_full_pae'], check=False)
-                    else:
-                        # Only save confidence scores for the first one since 'output' variable corresponds to the first batch
-                        if yp == yaml_path_list[0]:
-                            save_confidence_scores(results_final_dir, output, best_structure, out_name.replace('.yaml',''), 0)
-                            save_confidence_scores(results_final_dir_apo, output_apo, best_structure_apo, out_name.replace('.yaml',''), 0)
-                
+                        ax2.plot(con_loss_history, color=colors[1],linewidth=2)
+                        ax2.set_xlabel('Epochs', fontsize=12)
+                        ax2.set_ylabel('Intra-Contact Loss', fontsize=12)
+                        ax2.set_title('Intra-Contact Loss History', fontsize=14, pad=15)
+                        ax2.grid(True, linestyle='--', alpha=0.3)
+
+                        ax3.plot(i_con_loss_history, color=colors[2], linewidth=2)
+                        ax3.set_xlabel('Epochs', fontsize=12)
+                        ax3.set_ylabel('Inter-Contact Loss', fontsize=12)
+                        ax3.set_title('Inter-Contact Loss History', fontsize=14, pad=15)
+                        ax3.grid(True, linestyle='--', alpha=0.3)
+
+                        plt.tight_layout(pad=3.0)
+
+                        if loss_dir:
+                            plt.savefig(os.path.join(loss_dir, f'{target_binder_input}_loss_history_itr{itr + 1}_length{config["length"]}.png'),
+                                      facecolor='#1C1C1C', edgecolor='none', bbox_inches='tight', dpi=300)
+                        plt.show()
+                        plt.close()
+
+                        distogram_ani, sequence_ani = visualize_training_history(best_batch, loss_history, sequence_history, distogram_history, config["length"], binder_chain=config['binder_chain'], save_dir=animation_save_dir, save_filename=f"{target_binder_input}_itr{itr + 1}_length{config['length']}")
+                        if show_animation:
+                            from IPython.display import display, HTML
+                            display(HTML(f"<div style='display:flex;gap:10px'><div style='flex:0.4'>{distogram_ani.to_jshtml()}</div><div style='flex:0.6'>{sequence_ani.to_jshtml()}</div></div>"))
+
+                    except Exception as e:
+                        print(f"Error plotting loss history: {str(e)}")
+
+                    with open(rmsd_csv_path, 'a', newline='') as f:
+                        writer = csv.writer(f)
+                        if not csv_exists:
+                            writer.writerow(['target', 'length', 'iteration', 'apo_holo_rmsd', 'complex_plddt', 'iptm',  'helix_loss'])
+                            csv_exists = True
+                        writer.writerow([target_binder_input, config['length'], itr + 1, rmsd, output['complex_plddt'].item(), output['iptm'].item(), loss_scales['helix_loss']])
+
+                    best_batch_cpu = {k: v.detach().cpu().numpy() if torch.is_tensor(v) else v for k, v in best_batch.items()}
+                    best_sequence = ''.join([alphabet[i] for i in np.argmax(best_batch_cpu['res_type'][best_batch_cpu['entity_id']==chain_to_number[config['binder_chain']],:], axis=-1)])
+                    print("best_sequence", best_sequence)
+
+                    for yp in yaml_path_list:
+                        out_name = f"{yp.stem}_results_itr{itr + 1}_length{config['length']}.yaml"
+                        result_yaml = os.path.join(results_yaml_dir, out_name)
+                        result_yaml_apo = os.path.join(results_yaml_dir_apo, out_name)
+
+                        shutil.copy2(yp, result_yaml)
+                        with open(result_yaml, 'r') as f:
+                            data = yaml.safe_load(f)
+
+                        chain_num = chain_to_number[config['binder_chain']]
+                        data['sequences'][chain_num]['protein']['sequence'] = best_sequence
+                        data.pop('constraints', None)
+
+                        for seq in data['sequences']:
+                            if 'protein' in seq and 'msa' in seq['protein'] and seq['protein']['msa']:
+                                seq['protein']['msa'] = seq['protein']['msa'].replace('.npz', '.a3m')
+
+                        with open(result_yaml, 'w') as f:
+                            yaml.dump(data, f)
+
+                        shutil.copy2(result_yaml, result_yaml_apo)
+                        with open(result_yaml_apo, 'r') as f:
+                            data_apo = yaml.safe_load(f)
+
+                        data_apo['sequences'] = [data_apo['sequences'][chain_num]]
+                        data_apo.pop('constraints', None)
+
+                        with open(result_yaml_apo, 'w') as f:
+                            yaml.dump(data_apo, f)
+
+                        if redo_boltz_predict:
+                            subprocess.run([boltz_path, 'predict', str(result_yaml), '--out_dir', str(results_final_dir), '--write_full_pae'], check=False)
+                            subprocess.run([boltz_path, 'predict', str(result_yaml_apo), '--out_dir', str(results_final_dir_apo), '--write_full_pae'], check=False)
+                        else:
+                            if yp == yaml_path_list[0]:
+                                save_confidence_scores(results_final_dir, output, best_structure, out_name.replace('.yaml',''), 0)
+                                save_confidence_scores(results_final_dir_apo, output_apo, best_structure_apo, out_name.replace('.yaml',''), 0)
+
+                # Barrier to sync all ranks before next design sample
+                if use_dist:
+                    dist.barrier()
+
                 gc.collect()
                 torch.cuda.empty_cache()

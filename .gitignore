@@ -1,0 +1,27 @@
+# Log files
+*.log
+logs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Egg info
+*.egg-info/
+*.egg
+
+# Outputs
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Binaries
+DAlphaBall.gcc
+
+# Misc
+.DS_Store
+*.swp
+*.swo
+*~
